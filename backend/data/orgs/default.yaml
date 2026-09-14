@@ -1,0 +1,122 @@
+# NetProof org guardrails — policy pre-flight for the "acme" organisation.
+# Loaded for org `default` and merged over the built-in rule set (a rule with
+# the same `id` replaces its built-in). Failures with severity `critical`
+# hard-block the proposed change regardless of the main validator's score.
+org: acme
+
+rules:
+  - id: allow_all_rule
+    severity: warning
+    title: Allow-all firewall rule
+    message: A permit any → any rule makes the policy point meaningless for every flow. Prefer scoped src/dst/proto.
+    when: {change_type_in: [add_filter_rule, replace_filter_rule], rule_action: permit, rule_src: any, rule_dst: any, rule_proto: any}
+
+  - id: deny_all_rule
+    severity: warning
+    title: Deny-all firewall rule
+    message: A deny any → any rule at the top blocks everything behind that policy point.
+    when: {change_type_in: [add_filter_rule, replace_filter_rule], rule_action: deny, rule_src: any, rule_dst: any, rule_proto: any}
+
+  - id: expose_ssh
+    severity: warning
+    title: SSH exposed broadly
+    message: Permitting tcp/22 anywhere (dst=any) is a common escalation path. Confirm the blast radius.
+    when: {change_type_in: [add_filter_rule, replace_filter_rule], rule_action: permit, rule_proto: tcp, rule_dport_in: [22]}
+
+  - id: expose_rdp
+    severity: warning
+    title: RDP exposed broadly
+    message: Permitting tcp/3389 to dst=any hands out a remote-desktop foothold. Check scope.
+    when: {change_type_in: [add_filter_rule, replace_filter_rule], rule_action: permit, rule_proto: tcp, rule_dport_in: [3389]}
+
+  - id: remove_default_route
+    severity: critical
+    title: Default route removed
+    message: Removing the 0.0.0.0/0 route on a border device kills Internet egress for the whole branch.
+    when: {change_type: remove_route, route_network: 0.0.0.0/0}
+
+  - id: add_default_route
+    severity: info
+    title: Default route added
+    message: A new default route re-pins egress; ensure it is the intended upstream (dual-WAN, DR).
+    when: {change_type: add_route, route_network: 0.0.0.0/0}
+
+  - id: forward_ssh
+    severity: critical
+    title: SSH port-forward to the Internet
+    message: Publishing tcp/22 to the WAN exposes a shell to the world. Exclude or restrict source, and rotate creds first.
+    when: {change_type: add_dst_nat, dst_nat_port_in: [22]}
+
+  - id: forward_rdp
+    severity: critical
+    title: RDP port-forward to the Internet
+    message: Publishing tcp/3389 to the WAN is a ransomware-grade exposure. Use a VPN or previewing access.
+    when: {change_type: add_dst_nat, dst_nat_port_in: [3389]}
+
+  - id: forward_wide
+    severity: warning
+    title: Port-forward to a desktop
+    message: Forwarding to a workstation-class host (not a server) is unusual - double-check the target deserves public inbound.
+    when: {change_type: add_dst_nat, dst_nat_to_host: true}
+
+  # --- wider change language: BGP / OSPF / DNS / VLAN ---
+  - id: bgp_export_default
+    severity: warning
+    title: BGP exporting the default route
+    message: Advertising 0.0.0.0/0 over BGP is a route-leak risk toward transit peers. Verify the peering is a controlled edge.
+    when: {change_type: add_bgp_peer, bgp_export_default: true}
+
+  - id: bgp_neighbor_unreachable
+    severity: critical
+    title: BGP peer not in inventory
+    message: The BGP neighbor is not an address any modelled device owns - the session cannot come up.
+    when: {change_type: add_bgp_peer, bgp_neighbor_unreachable: true}
+
+  - id: ospf_wan_advertise
+    severity: warning
+    title: OSPF across a WAN link
+    message: Advertising a WAN/Internet-facing subnet into OSPF leaks interior topology toward the provider.
+    when: {change_type: add_ospf_network, ospf_advertise_wan: true}
+
+  - id: dns_unmanaged_target
+    severity: warning
+    title: DNS pointing outside managed inventory
+    message: The record target is not an address any managed device owns. Names will resolve into a silent blackhole.
+    when: {change_type: add_dns_record, dns_unmanaged_target: true}
+
+  - id: vlan_reserved
+    severity: critical
+    title: Reserved VLAN id
+    message: VLAN ids below 1 or above 4094 are reserved and will be rejected by the switch.
+    when: {change_type: add_vlan_assignment, vlan_id_lt: 1}
+
+  - id: vlan_4094
+    severity: critical
+    title: VLAN id beyond the legal range
+    message: VLAN ids above 4094 cannot exist in 802.1Q.
+    when: {change_type: add_vlan_assignment, vlan_id_gt: 4094}
+
+  - id: vlan_native_one
+    severity: warning
+    title: Assignment into the native VLAN
+    message: Placing a port in VLAN 1 reuses the native/default segment. Use a named segment for access ports.
+    when: {change_type: add_vlan_assignment, vlan_id_lt: 2}
+
+  - id: vlan_segment_move
+    severity: warning
+    title: Switchport segments change
+    message: Reassigning a live access port moves everything behind it onto a new L2 segment.
+    when: {change_type: add_vlan_assignment, vlan_segment_move: true}
+
+  - id: vlan_on_host
+    severity: critical
+    title: VLAN assigned to a host
+    message: VLAN assignments only apply to switch/router ports.
+    when: {change_type: add_vlan_assignment, vlan_on_host: true}
+
+  # org-specific override: this org treats every BGP peering as high-risk.
+  - id: bgp_any_peering
+    severity: warning
+    title: New BGP peering requires a ticket
+    message: Acme requires a change ticket before any BGP peering is added. Reference one in the change description.
+    when: {change_type: add_bgp_peer}

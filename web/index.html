@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NetProof — validate network changes before they break the network</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9989;</text></svg>" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="bg"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <rect x="2" y="2" width="28" height="28" rx="8" fill="rgba(47,158,138,0.14)" stroke="rgba(94,200,178,0.55)"/>
+        <path d="M10 21v-6h6v6m0-6v-6h6v6" stroke="#5ec8b2" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="10" cy="21" r="1.6" fill="#5ec8b2"/>
+        <circle cx="16" cy="15" r="1.6" fill="#5ec8b2"/>
+        <circle cx="22" cy="21" r="1.6" fill="#5ec8b2"/>
+      </svg>
+      <div class="brand-text">
+        <h1>NetProof</h1>
+        <p>neutral network-change validation</p>
+      </div>
+    </div>
+    <div class="topmeta">
+      <div class="mode-switch" id="mode-switch">
+        <button data-mode="demo"><span class="ms-main">Demo</span><span class="ms-sub">preloaded sample network</span></button>
+        <button data-mode="scan"><span class="ms-main">Live</span><span class="ms-sub">scan this machine's LAN</span></button>
+        <button data-mode="agent"><span class="ms-main">Agent</span><span class="ms-sub">managed network report</span></button>
+      </div>
+      <button class="reset-btn" id="reset-btn" title="Restore the network to its original state and clear the test results">↻ Restart test</button>
+      <span class="chip" id="net-chip">Network</span>
+      <span class="engine-pill"><i></i> engine online</span>
+    </div>
+    <div class="mode-hint" id="mode-hint"></div>
+  </header>
+  <div class="demo-banner" id="demo-banner" hidden>
+    <span class="demo-badge">DEMO DATA</span>
+    <span id="demo-banner-text">You're looking at a preloaded sample network — no real device has been scanned. Switch to <b>Live</b> to discover your actual LAN.</span>
+    <button type="button" id="demo-dismiss" title="Hide until next reload">✕</button>
+  </div>
+
+  <main class="layout">
+
+    <!-- TOP : scan + network summary -->
+    <section class="top-zone">
+      <div class="card scan-card" id="scan-card">
+        <div class="card-head">
+          <h2>Scan a network</h2>
+          <span class="mono dim">live discovery</span>
+        </div>
+        <form class="scan-form" id="scan-form">
+          <div class="field">
+            <label for="scan-target">Router / server IP (or CIDR)</label>
+            <input id="scan-target" placeholder="192.168.1.1" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="grid2">
+            <div class="field">
+              <label for="scan-community">SNMP community <span class="dim">(opt)</span></label>
+              <input id="scan-community" placeholder="public" spellcheck="false" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label>&nbsp;</label>
+              <button type="submit" class="btn" id="scan-btn">Discover systems</button>
+            </div>
+          </div>
+          <p class="scan-note" id="scan-note">Sweeps the target's subnet: ARP + ping + service ports.</p>
+        </form>
+      </div>
+
+      <div class="card agent-card" id="agent-card" hidden>
+        <div class="card-head">
+          <h2>Managed network</h2>
+          <span class="mono dim">agent report</span>
+        </div>
+        <p class="muted" id="agent-desc">An account is a real network whose local agent has checked in. The dashboard renders that report — it never scans on its own.</p>
+        <div class="agent-root">
+          <div class="field">
+            <label for="agent-org">Account</label>
+            <div class="agent-row">
+              <select id="agent-org"><option value="">— loading accounts… —</option></select>
+              <button type="button" class="btn btn-secondary" id="agent-new">+ New account</button>
+            </div>
+          </div>
+          <div class="agent-create" id="agent-create" hidden>
+            <div class="field">
+              <label for="agent-new-name">Name this account (your company / site)</label>
+              <div class="agent-row">
+                <input id="agent-new-name" placeholder="e.g. HQ office" spellcheck="false" autocomplete="off" />
+                <button type="button" class="btn" id="agent-create-go">Create</button>
+              </div>
+            </div>
+          </div>
+          <div class="agent-onboard" id="agent-onboard" hidden></div>
+          <div class="agent-report" id="agent-report" hidden></div>
+          <div class="agent-tip" id="agent-tip" hidden>
+            <div class="agent-tip-title">How this works</div>
+            <ol>
+              <li>Pick a network, then run the agent inside it (see the key copy below).</li>
+              <li>The agent discovers the segment and pushes its report <b>outbound</b> to this server.</li>
+              <li>Rules you didn't supply in a device config are labeled <span class="src-badge inferred">inferred</span>; ones matched against real config are <span class="src-badge confirmed">confirmed</span>.</li>
+            </ol>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" id="network-card">
+        <div class="card-head">
+          <h2 id="net-title">Network</h2>
+          <span class="mono dim" id="net-zones-count"></span>
+        </div>
+        <p class="muted" id="net-desc">Loading…</p>
+        <div class="zone-chips" id="zone-chips"></div>
+        <div class="confirm-summary" id="confirm-summary" hidden></div>
+      </div>
+    </section>
+
+    <!-- VISUAL : Packet-Tracer style map, always above the change builder -->
+    <section class="vis-zone">
+      <div class="card topo-card">
+        <div class="card-head">
+          <h2>Network map <span class="map-hint">— tap a device to inspect it</span></h2>
+          <span class="mono dim" id="topo-count"></span>
+        </div>
+        <div class="topo-wrap">
+          <svg id="topo" viewBox="0 0 1200 600" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Network topology"></svg>
+          <div class="topo-legend">
+            <span><i class="dot" style="--c:#6b9bd4"></i> router</span>
+            <span><i class="dot" style="--c:#c49adf"></i> firewall</span>
+            <span><i class="dot" style="--c:#d9a55c"></i> switch</span>
+            <span><i class="dot" style="--c:#4cb782"></i> pc · laptop</span>
+            <span><i class="dot" style="--c:#5ec8b2"></i> phone</span>
+            <span><i class="dot" style="--c:#b98ce0"></i> printer</span>
+            <span><i class="dot" style="--c:#96a4b4"></i> server · cloud</span>
+          </div>
+          <div class="dev-detail" id="dev-detail" hidden></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- BELOW : details + change builder -->
+    <section class="cols-zone">
+      <section class="left">
+        <div class="card" id="devices-card" hidden>
+          <div class="card-head">
+            <h2>Discovered systems</h2>
+            <span class="mono dim" id="dev-count"></span>
+          </div>
+          <div class="dev-filters" id="dev-filters">
+            <button data-df="all" class="active">all</button>
+            <button data-df="router">router</button>
+            <button data-df="host">hosts</button>
+            <button data-df="server">servers</button>
+            <button data-df="printer">printers</button>
+          </div>
+          <div class="dev-list" id="dev-list"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Policy requirements</h2>
+            <span class="mono dim" id="req-count"></span>
+          </div>
+          <div class="req-list" id="req-list"></div>
+        </div>
+      </section>
+
+      <section class="right">
+        <div class="card builder">
+          <div class="card-head">
+            <h2>Propose a change</h2>
+            <span class="mono dim">the referee test</span>
+          </div>
+
+          <div class="field preset-field">
+            <label for="preset">Try an example</label>
+            <select id="preset">
+              <option value="__custom">— custom change —</option>
+            </select>
+            <p class="hint" id="preset-desc"></p>
+          </div>
+
+          <div class="divider"><span>or describe it in plain words</span></div>
+
+          <div class="field intent-field">
+            <label for="intent">Intent (English → change)</label>
+            <div class="intent-row">
+              <input id="intent" placeholder="e.g. block ssh from user-pc to app-server" spellcheck="false" autocomplete="off" />
+              <button type="button" class="btn btn-secondary" id="intent-btn">Parse</button>
+            </div>
+            <p class="hint" id="intent-status">Examples: “block ssh from user-pc to app-server” · “allow http from any to app-server” · “port-forward 8080 to app-server:80” · “add route 10.99.0.0/16 via 192.168.1.2 on firewall”.</p>
+          </div>
+
+          <div class="divider"><span>or build one field-by-field</span></div>
+
+          <div class="change-form">
+            <div class="field">
+              <label for="ch-type">Change type</label>
+              <select id="ch-type">
+                <option value="add_filter_rule">Add firewall / ACL rule</option>
+                <option value="remove_filter_rule">Remove firewall / ACL rule</option>
+                <option value="replace_filter_rule">Replace firewall / ACL rule</option>
+                <option value="add_route">Add static route</option>
+                <option value="remove_route">Remove static route</option>
+                <option value="add_dst_nat">Add port forward (DST NAT)</option>
+                <option value="remove_dst_nat">Remove port forward</option>
+                <option value="add_bgp_peer">Add BGP peering</option>
+                <option value="add_ospf_network">Advertise OSPF network</option>
+                <option value="add_dns_record">Add DNS record</option>
+                <option value="add_vlan_assignment">Assign switchport to VLAN</option>
+              </select>
+            </div>
+
+            <div class="grid2" data-for="add_filter_rule remove_filter_rule replace_filter_rule">
+              <div class="field">
+                <label for="f-filter">Policy point</label>
+                <select id="f-filter"></select>
+              </div>
+              <div class="field">
+                <label for="f-index">Position (index)</label>
+                <input id="f-index" type="number" min="0" placeholder="0" />
+              </div>
+            </div>
+
+            <div class="grid2" data-for="add_filter_rule replace_filter_rule">
+              <div class="field">
+                <label for="f-action">Action</label>
+                <select id="f-action">
+                  <option value="permit">permit</option>
+                  <option value="deny">deny</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="f-proto">Protocol</label>
+                <select id="f-proto">
+                  <option value="tcp">tcp</option>
+                  <option value="udp">udp</option>
+                  <option value="icmp">icmp</option>
+                  <option value="any">any</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="f-src">Source</label>
+                <input id="f-src" list="net-sources" placeholder="10.0.10.0/24, a device IP, or any" spellcheck="false" autocomplete="off" />
+              </div>
+              <div class="field">
+                <label for="f-dst">Destination</label>
+                <input id="f-dst" list="net-destinations" placeholder="10.0.20.0/24, a device IP, or any" spellcheck="false" autocomplete="off" />
+              </div>
+              <div class="field" data-dport>
+                <label for="f-dport">Port (optional)</label>
+                <input id="f-dport" type="number" min="1" max="65535" placeholder="443" />
+              </div>
+            </div>
+
+            <div class="grid2" data-for="add_route remove_route">
+              <div class="field">
+                <label for="r-device">Device</label>
+                <select id="r-device"></select>
+              </div>
+              <div class="field" data-for="remove_route">
+                <label for="r-index">Route index</label>
+                <input id="r-index" type="number" min="0" placeholder="0" />
+              </div>
+              <div class="field" data-for="add_route">
+                <label for="r-network">Network</label>
+                <input id="r-network" list="net-routes-opt" placeholder="0.0.0.0/0" spellcheck="false" autocomplete="off" />
+              </div>
+              <div class="field" data-for="add_route">
+                <label for="r-nh">Next hop</label>
+                <input id="r-nh" list="net-ips" placeholder="203.0.113.1" spellcheck="false" autocomplete="off" />
+              </div>
+            </div>
+
+            <div class="grid2" data-for="add_dst_nat remove_dst_nat">
+              <div class="field">
+                <label for="dn-device">Router / firewall</label>
+                <select id="dn-device"></select>
+              </div>
+              <div class="field" data-for="remove_dst_nat">
+                <label for="dn-index">Forward index</label>
+                <input id="dn-index" type="number" min="0" placeholder="0" />
+              </div>
+              <div class="field" data-for="add_dst_nat">
+                <label for="dn-public-port">Public port (Internet)</label>
+                <input id="dn-public-port" type="number" min="1" max="65535" placeholder="8080" />
+              </div>
+              <div class="field" data-for="add_dst_nat">
+                <label for="dn-private-ip">Forward to host</label>
+                <select id="dn-private-ip"></select>
+              </div>
+              <div class="field" data-for="add_dst_nat">
+                <label for="dn-private-port">Host port</label>
+                <input id="dn-private-port" type="number" min="1" max="65535" placeholder="80" />
+              </div>
+              <div class="field" data-for="add_dst_nat">
+                <label for="dn-proto">Protocol</label>
+                <select id="dn-proto">
+                  <option value="tcp">tcp</option>
+                  <option value="udp">udp</option>
+                </select>
+</div>
+          </div>
+
+            <div class="grid2" data-for="add_bgp_peer">
+              <div class="field">
+                <label for="bgp-device">Device</label>
+                <select id="bgp-device"></select>
+              </div>
+              <div class="field">
+                <label for="bgp-neighbor">Neighbor IP</label>
+                <input id="bgp-neighbor" list="net-ips" placeholder="203.0.113.1" spellcheck="false" autocomplete="off" />
+              </div>
+              <div class="field">
+                <label for="bgp-local-as">Local AS</label>
+                <input id="bgp-local-as" type="number" min="1" max="65535" placeholder="64512" />
+              </div>
+              <div class="field">
+                <label for="bgp-remote-as">Remote AS</label>
+                <input id="bgp-remote-as" type="number" min="1" max="65535" placeholder="65000" />
+              </div>
+              <div class="field">
+                <label for="bgp-export">Export prefix <span class="dim">(CIDR)</span></label>
+                <input id="bgp-export" placeholder="10.0.0.0/16" spellcheck="false" autocomplete="off" />
+              </div>
+            </div>
+
+            <div class="grid2" data-for="add_ospf_network">
+              <div class="field">
+                <label for="ospf-device">Device</label>
+                <select id="ospf-device"></select>
+              </div>
+              <div class="field">
+                <label for="ospf-area">Area id</label>
+                <input id="ospf-area" type="number" min="0" max="4294967295" placeholder="0" value="0" />
+              </div>
+              <div class="field">
+                <label for="ospf-network">Network</label>
+                <input id="ospf-network" list="net-routes-opt" placeholder="10.0.0.0/16" spellcheck="false" autocomplete="off" />
+              </div>
+            </div>
+
+            <div class="grid2" data-for="add_dns_record">
+              <div class="field">
+                <label for="dns-device">DNS server</label>
+                <select id="dns-device"></select>
+              </div>
+              <div class="field">
+                <label for="dns-zone">Zone</label>
+                <input id="dns-zone" placeholder="internal" spellcheck="false" autocomplete="off" />
+              </div>
+              <div class="field">
+                <label for="dns-fqdn">FQDN</label>
+                <input id="dns-fqdn" placeholder="portal.internal" spellcheck="false" autocomplete="off" />
+              </div>
+              <div class="field">
+                <label for="dns-type">Record type</label>
+                <select id="dns-type">
+                  <option value="A">A</option>
+                  <option value="AAAA">AAAA</option>
+                  <option value="CNAME">CNAME</option>
+                  <option value="MX">MX</option>
+                  <option value="TXT">TXT</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="dns-value">Value</label>
+                <input id="dns-value" list="net-ips" placeholder="10.0.20.10" spellcheck="false" autocomplete="off" />
+              </div>
+              <div class="field">
+                <label for="dns-ttl">TTL</label>
+                <input id="dns-ttl" type="number" min="0" max="86400" placeholder="300" value="300" />
+              </div>
+            </div>
+
+            <div class="grid2" data-for="add_vlan_assignment">
+              <div class="field">
+                <label for="vlan-device">Switch</label>
+                <select id="vlan-device"></select>
+              </div>
+              <div class="field">
+                <label for="vlan-iface">Interface</label>
+                <input id="vlan-iface" placeholder="Gi0/3" spellcheck="false" autocomplete="off" />
+              </div>
+              <div class="field">
+                <label for="vlan-id">VLAN id</label>
+                <input id="vlan-id" type="number" min="1" max="4094" placeholder="30" />
+              </div>
+              <div class="field">
+                <label for="vlan-name">VLAN name</label>
+                <input id="vlan-name" placeholder="guest" spellcheck="false" autocomplete="off" />
+              </div>
+            </div>
+
+          <div class="hint-box" id="change-hint"></div>
+
+          <button id="run" class="btn-run">
+            <span>Run validation</span>
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          </button>
+        </div>
+
+        <div class="recent" id="recent-wrap" hidden>
+          <div class="card-head">
+            <h2 class="sm">Recent validations</h2>
+          </div>
+          <div class="recent-row" id="recent"></div>
+        </div>
+
+        <div class="card result" id="result" hidden>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <datalist id="net-sources"></datalist>
+  <datalist id="net-destinations"></datalist>
+  <datalist id="net-routes-opt"></datalist>
+  <datalist id="net-ips"></datalist>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

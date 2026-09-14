@@ -1,0 +1,29 @@
+# --- Python / env ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+lib/venv/
+lib/venv/**/*.pyc
+venv/
+.venv/
+
+# --- Local data / secrets (tenant orgs + agent reports, never pushed) ---
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+backend/data/*.db*
+backend/*.db*
+backend/tenants.db
+backend/data/tenants.db
+*.sqlite*
+!backend/data/*.yaml
+!backend/data/orgs/*.yaml
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+*.local
+run/
+logs/

@@ -1,0 +1,248 @@
+name: Acme Corporation
+description: Small office network - LAN and server VLAN behind a stateful firewall with NAT to the Internet.
+
+devices:
+  - name: user-pc
+    type: host
+    x: 80
+    y: 190
+    interfaces:
+      eth0:
+        ip: 10.0.10.50/24
+        network: office-lan
+        connected_to: core-switch Gi0/1
+    routes:
+      - network: 0.0.0.0/0
+        next_hop: 10.0.10.1
+
+  - name: app-server
+    type: host
+    x: 80
+    y: 420
+    interfaces:
+      eth0:
+        ip: 10.0.20.10/24
+        network: server-net
+        connected_to: core-switch Gi0/2
+    routes:
+      - network: 0.0.0.0/0
+        next_hop: 10.0.20.1
+
+  - name: dns-server
+    type: server
+    x: 170
+    y: 420
+    interfaces:
+      eth0:
+        ip: 10.0.20.53/24
+        network: server-net
+        label: DNS
+        connected_to: core-switch Gi0/3
+    routes:
+      - network: 0.0.0.0/0
+        next_hop: 10.0.20.1
+    dns:
+      - zone: internal
+        fqdn: portal.internal
+        type: A
+        value: 10.0.20.10
+      - zone: internal
+        fqdn: wiki.internal
+        type: A
+        value: 10.0.20.10
+      - zone: internal
+        fqdn: users.internal
+        type: A
+        value: 10.0.10.50
+
+  - name: core-switch
+    type: switch
+    x: 300
+    y: 300
+    interfaces:
+      Gi0/1:
+        ip: 10.0.10.1/24
+        network: office-lan
+        label: Users
+        connected_to: user-pc eth0
+        filters:
+          - core-user-in
+      Gi0/2:
+        ip: 10.0.20.1/24
+        network: server-net
+        label: Servers
+        connected_to: app-server eth0
+      Gi0/3:
+        network: server-net
+        label: DNS
+        connected_to: dns-server eth0
+      Gi0/4:
+        network: office-lan
+        label: Spare
+      Gi0/0:
+        ip: 192.168.1.2/30
+        network: lan-edge
+        label: To Firewall
+        connected_to: firewall Inside
+    routes:
+      - network: 0.0.0.0/0
+        next_hop: 192.168.1.1
+    ospf:
+      - area_id: 0
+        networks:
+          - 10.0.10.0/24
+          - 10.0.20.0/24
+    vlans:
+      - iface: Gi0/1
+        vlan_id: 10
+        name: office
+      - iface: Gi0/2
+        vlan_id: 20
+        name: servers
+      - iface: Gi0/3
+        vlan_id: 20
+        name: servers
+
+  - name: firewall
+    type: firewall
+    x: 540
+    y: 300
+    interfaces:
+      Inside:
+        ip: 192.168.1.1/30
+        network: lan-edge
+        label: Trusted
+        connected_to: core-switch Gi0/0
+        filters:
+          - fw-inside-in
+      Outside:
+        ip: 203.0.113.2/29
+        network: wan
+        label: ISP
+        connected_to: isp-router Gi0/0
+        filters:
+          - fw-outside-in
+    routes:
+      - network: 10.0.0.0/16
+        next_hop: 192.168.1.2
+      - network: 0.0.0.0/0
+        next_hop: 203.0.113.1
+    nat:
+      outside_interface: Outside
+      inside_networks:
+        - 10.0.0.0/16
+        - 192.168.1.0/30
+    ospf:
+      - area_id: 0
+        networks:
+          - 192.168.1.0/30
+
+  - name: isp-router
+    type: router
+    x: 790
+    y: 300
+    interfaces:
+      Gi0/0:
+        ip: 203.0.113.1/29
+        network: wan
+        label: Customer Handoff
+        connected_to: firewall Outside
+      Gi0/1:
+        ip: 198.51.100.1/24
+        network: public-cloud
+        label: Upstream
+        connected_to: internet-cloud eth0
+    routes:
+      - network: 0.0.0.0/0
+        next_hop: 198.51.100.2
+
+  - name: internet-cloud
+    type: cloud
+    x: 1030
+    y: 300
+    interfaces:
+      eth0:
+        ip: 198.51.100.2/24
+        network: public-cloud
+        label: The Internet
+        connected_to: isp-router Gi0/1
+
+filters:
+  - name: core-user-in
+    default: permit
+    rules: []
+
+  - name: fw-inside-in
+    default: deny
+    rules:
+      - action: permit
+        src: 10.0.10.0/24
+        dst: 10.0.20.0/24
+        proto: tcp
+        dport: 443
+      - action: permit
+        src: 10.0.10.0/24
+        dst: 10.0.20.0/24
+        proto: tcp
+        dport: 22
+      - action: permit
+        src: 10.0.10.0/24
+        dst: any
+        proto: tcp
+        dport: 80
+      - action: permit
+        src: 10.0.10.0/24
+        dst: any
+        proto: tcp
+        dport: 443
+
+  - name: fw-outside-in
+    default: deny
+    rules:
+      - action: permit
+        src: any
+        dst: 203.0.113.2
+        proto: tcp
+        dport: 443
+
+zones:
+  office-lan:
+    prefix: 10.0.10.0/24
+    gateway: core-switch
+    source: true
+    dest: true
+  server-net:
+    prefix: 10.0.20.0/24
+    gateway: core-switch
+    source: true
+    dest: true
+  internet:
+    gateway: internet-cloud
+    sample_dst: 8.8.8.8
+    source: false
+    dest: true
+
+requirements:
+  - name: users-to-app
+    src: 10.0.10.50
+    dst: 10.0.20.10
+    proto: tcp
+    dport: 443
+    expect: reachable
+  - name: admins-to-app-ssh
+    src: 10.0.10.50
+    dst: 10.0.20.10
+    proto: tcp
+    dport: 22
+    expect: reachable
+  - name: users-to-internet
+    src: 10.0.10.50
+    dst: 8.8.8.8
+    proto: tcp
+    dport: 443
+    expect: reachable
+  - name: servers-no-internet
+    src: 10.0.20.10
+    dst: 8.8.8.8
+    proto: any
+    expect: denied
