@@ -15,6 +15,10 @@ const TYPE_COLORS = {
   printer: "#b98ce0",
   cloud: "#96a4b4",
   internet: "#96a4b4",
+  laptop: "#5ec8b2",
+  mobile: "#f0a070",
+  phone: "#f0a070",
+  camera: "#e07090",
 };
 
 const DTYPE_ORDER = ["router", "switch", "server", "host", "printer", "cloud"];
@@ -113,6 +117,7 @@ function renderAll() {
   renderRequirements(model().requirements, null);
   fillPolicySelects();
   fillAddressLists();
+  applyChangeTypeFilter();
   refreshHint();
   if (NET && NET.presets) {
     const ok = MODE === "demo";
@@ -222,9 +227,17 @@ const ICON_SHAPES = {
     <rect x="34" y="25.5" width="11" height="4" rx="1"/>
     <circle cx="49" cy="27.5" r="1.4"/>
     <rect x="13" y="38.5" width="46" height="2.6" rx="1.3" fill="#2a3847"/>`,
-  cloud: `
-    <path d="M23 34 a8 8 0 0 1 -3.4 -15.4 a11 11 0 0 1 21.6 -3.6 a9 9 0 0 1 1.8 17.9 Z" fill="#131a22"/>
-    <path d="M27 31 a5.5 5.5 0 0 1 -1.8 -10.6 a7.6 7.6 0 0 1 14.6 -2.2 a6.3 6.3 0 0 1 1.1 12.3 Z" fill="#0c1116"/>`,
+  camera: `
+    <rect x="18" y="16" width="36" height="26" rx="4" fill="#131a22"/>
+    <path d="M54 22 L64 17 L64 37 L54 32 Z" fill="#131a22"/>
+    <circle cx="36" cy="29" r="7" fill="#0c1116" stroke="currentColor" stroke-width="1.4"/>
+    <circle cx="36" cy="29" r="3.5" fill="#131a22"/>
+    <circle cx="48" cy="20" r="2" fill="currentColor"/>`,
+  mobile: `
+    <rect x="27" y="5" width="18" height="42" rx="4.5" fill="#131a22"/>
+    <rect x="29.8" y="9" width="12.4" height="31" rx="2" fill="#0c1116" stroke="#2a3847" stroke-width="1"/>
+    <rect x="32" y="6.6" width="8" height="1.4" rx="0.7" fill="#3a4a5c"/>
+    <circle cx="36" cy="43.5" r="1.6"/>`,
 };
 
 function deviceIcon(type, size = 72) {
@@ -370,6 +383,7 @@ function nodeDisplayName(dev) {
 }
 
 function renderTopo() {
+  stopTopoFlowOverlay();
   const svg = $("topo");
   svg.innerHTML = "";
   nodeCoords = {};
@@ -417,6 +431,15 @@ function renderTopo() {
   });
 
   svg.innerHTML = out;
+  // Auto-size the SVG viewBox to fit all nodes with padding
+  const PAD = 80;
+  const xs = devs.map((d) => d.x), ys = devs.map((d) => d.y);
+  const minX = Math.min(...xs) - PAD, minY = Math.min(...ys) - PAD;
+  const maxX = Math.max(...xs) + PAD, maxY = Math.max(...ys) + PAD;
+  const vw = maxX - minX, vh = maxY - minY;
+  svg.setAttribute("viewBox", `${minX} ${minY} ${vw} ${vh}`);
+  svg.style.width = "100%";
+  svg.style.height = Math.max(480, vh) + "px";
   svg.appendChild(svgStyle());
   wireTopoClicks(svg);
 }
@@ -434,6 +457,8 @@ function svgStyle() {
     .node.flash .sel-ring { stroke:#d9a55c; stroke-width:3; }
     .node.flash-block .sel-ring { stroke:#d97b6f; stroke-width:3; }
     .node.flash.sent .sel-ring { stroke:#4cb782; stroke-width:3; }
+    @keyframes nodeFlash { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    .node.flash .sel-ring, .node.flash-block .sel-ring { animation: nodeFlash 0.38s ease; }
   `;
   return s;
 }
@@ -682,7 +707,7 @@ async function applyProtect() {
 function renderDevices(devices) {
   const protect = MODE === "scan";
   $("dev-count").textContent = devices.length + " systems";
-  const tint = { router: "rgba(107,155,212,0.15)", switch: "rgba(217,165,92,0.15)", host: "rgba(76,183,130,0.15)", server: "rgba(150,164,180,0.15)", printer: "rgba(185,140,224,0.15)" };
+  const tint = { router: "rgba(107,155,212,0.15)", switch: "rgba(217,165,92,0.15)", host: "rgba(76,183,130,0.15)", server: "rgba(150,164,180,0.15)", printer: "rgba(185,140,224,0.15)", laptop: "rgba(94,200,178,0.15)", mobile: "rgba(240,160,112,0.15)", phone: "rgba(240,160,112,0.15)", camera: "rgba(224,112,144,0.15)" };
   const list = devices.filter((d) => devFilter === "all" || d.type_guess === devFilter || (devFilter === "host" && ["host", "server"].includes(d.type_guess)) || (devFilter === "router" && d.is_target));
   $("dev-list").innerHTML = list.map((d) => {
     const cls = d.is_target ? "target" : "";
@@ -1371,6 +1396,22 @@ function updateVisibility() {
   refreshHint();
 }
 
+/* A live scan has no BGP/OSPF config, DNS zone or switchport VLANs to change —
+   offering those change types on a discovered LAN only produces confusing
+   control-plane noise. Keep them for the Demo model and hide them in scan/agent. */
+const DEMO_ONLY_CHANGE_TYPES = ["add_bgp_peer", "add_ospf_network", "add_dns_record", "add_vlan_assignment"];
+
+function applyChangeTypeFilter() {
+  const sel = $("ch-type");
+  if (!sel) return;
+  const hide = (MODE === "scan" || MODE === "agent") ? DEMO_ONLY_CHANGE_TYPES : [];
+  Array.from(sel.options).forEach((opt) => { opt.hidden = hide.includes(opt.value); });
+  let cur = sel.value;
+  if (hide.includes(cur)) cur = "add_filter_rule";
+  sel.value = cur;
+  updateVisibility();
+}
+
 function syncFields() {
   const t = $("ch-type").value;
   if (!t.includes("_filter_rule")) return;
@@ -1420,6 +1461,10 @@ async function run() {
   renderRequirements(model().requirements, report);
   recordRecent(report);
   $("result").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  // scroll map into view and start the live-flow overlay
+  const topoCard = document.querySelector(".topo-card");
+  if (topoCard) topoCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  startTopoFlowOverlay(report);
 }
 
 async function fetchGuardrails(change) {
@@ -1588,7 +1633,18 @@ function renderResult(report) {
   });
 
   const sim = $("sim-panel");
-  if (sim) setTimeout(() => { startSim(sim, 0); }, 550);
+  if (sim) setTimeout(() => {
+    if ((sim._massSrcs || 0) >= 2) { runMassSim(sim); return; }
+    const flows = sim._flows || [];
+    const rank = (f) => (f.after && f.after.reachable === false) ? 0
+      : (hasPath(f.after) || hasPath(f.before)) ? 1 : 2;
+    let bestIdx = -1, bestRank = 2;
+    flows.forEach((f, i) => {
+      const r = rank(f);
+      if (r < bestRank) { bestRank = r; bestIdx = i; }
+    });
+    if (bestIdx >= 0) startSim(sim, bestIdx);
+  }, 550);
 }
 
 function renderGuardrails(checks) {
@@ -1867,6 +1923,12 @@ function renderDiff(report) {
    and after the proposed change. Purely visual — nothing is ever sent. */
 let simCancelCtl = 0;
 
+/* Has a usable packet path to animate (control-plane findings like DNS/BGP
+   carry no data-plane path and must be skipped by the live simulation). */
+function hasPath(d) {
+  return !!d && Array.isArray(d.path) && d.path.length > 0;
+}
+
 let simRunner = { paused: false, speed: 1, _gateResolve: null, stepping: false };
 
 function simGate(ctl) {
@@ -1892,7 +1954,11 @@ function onPlay(wrap) {
     setSimStatus(wrap, "resumed.");
     return;
   }
-  if (!wrap._runCtl) { simRunner.stepping = false; startSim(wrap); }
+  if (!wrap._runCtl) {
+    simRunner.stepping = false;
+    if ((wrap._massSrcs || 0) >= 2) runMassSim(wrap);
+    else startSim(wrap);
+  }
 }
 
 function onPause(wrap) {
@@ -1937,13 +2003,35 @@ function buildSimPanel(report) {
   };
   const flows = [];
   (report.findings || []).forEach((f, i) => {
+    if (!hasPath(f.before) && !hasPath(f.after)) return;
     flows.push({ key: "f" + i, label: f.title || "finding", before: f.before, after: f.after, srcMeta: null });
   });
   Object.keys(report.matrix || {}).forEach((k) => {
     const cell = report.matrix[k];
     flows.push({ key: "m" + k, label: pairLabel(k), before: cell.before, after: cell.after, srcMeta: null });
   });
+  /* rank flows: new blocks first (this is the drama), path/state changes next,
+     untouched baseline flows last — so Play always starts with the good stuff. */
+  const affected = (f) => {
+    const b = f.before || {}, a = f.after || {};
+    if (a.reachable === false) return 0;
+    if (hasPath(b) && hasPath(a) &&
+        (a.reachable !== b.reachable ||
+         (a.path || []).join(">").replace(":0", "") !== (b.path || []).join(">").replace(":0", ""))) return 1;
+    return 2;
+  };
+  flows.sort((x, y) => affected(x) - affected(y));
   wrap._flows = flows;
+  /* count of distinct devices whose traffic is blocked AFTER the change —
+     used to trigger the full-map "play every block at once" replay. */
+  const bsrc = new Set();
+  flows.forEach((f) => {
+    if (f.after && f.after.reachable === false) {
+      const p = (f.after.path || [])[0];
+      if (p) bsrc.add(p);
+    }
+  });
+  wrap._massSrcs = bsrc.size;
   const opts = flows.map((f, i) =>
     `<option value="${i}">${esc(f.label)} · after: ${f.after && f.after.reachable ? "reachable" : fateWord((f.after || {}).status || "—")}</option>`
   ).join("");
@@ -2043,20 +2131,71 @@ function extendPathFromSteps(path, steps) {
 
 function animateSegment(svg, from, to, color, ctl) {
   return new Promise((resolve) => {
-    const dot = svgNS("circle", { cx: from.x, cy: from.y, r: 7, fill: color, "stroke": "#0b0f14", "stroke-width": 1.6, class: "sim-dot" });
+    const route = svgNS("line", {
+      x1: from.x, y1: from.y, x2: to.x, y2: to.y,
+      stroke: color, "stroke-width": 3, "stroke-dasharray": "2 8", "stroke-linecap": "round",
+      "stroke-opacity": 0.9, class: "sim-route",
+    });
+    const glow = svgNS("circle", { cx: from.x, cy: from.y, r: 18, fill: color, "fill-opacity": 0.3, class: "sim-dot sim-glow" });
+    const dot = svgNS("circle", { cx: from.x, cy: from.y, r: 10, fill: color, "stroke": "#0b0f14", "stroke-width": 2, class: "sim-dot" });
+    svg.appendChild(route);
+    svg.appendChild(glow);
     svg.appendChild(dot);
+    const dur = 950 / simRunner.speed;
     const t0 = performance.now();
-    const dur = 400;
     function frame(t) {
-      if (ctl !== simCancelCtl) { dot.remove(); resolve(); return; }
+      if (ctl !== simCancelCtl) { glow.remove(); dot.remove(); resolve(); return; }
       let p = Math.min(1, (t - t0) / dur);
-      const e = 1 - Math.pow(1 - p, 2.2);
-      dot.setAttribute("cx", from.x + (to.x - from.x) * e);
-      dot.setAttribute("cy", from.y + (to.y - from.y) * e);
-      if (p < 1) { requestAnimationFrame(frame); } else { dot.remove(); resolve(); }
+      const e = 1 - Math.pow(1 - p, 2);
+      const cx = from.x + (to.x - from.x) * e;
+      const cy = from.y + (to.y - from.y) * e;
+      glow.setAttribute("cx", cx); glow.setAttribute("cy", cy);
+      dot.setAttribute("cx", cx); dot.setAttribute("cy", cy);
+      if (p < 1) requestAnimationFrame(frame);
+      else { glow.remove(); dot.remove(); resolve(); }
     }
     requestAnimationFrame(frame);
   });
+}
+
+let _traceEl = null;
+
+function clearSimSvg() {
+  const svg = $("topo");
+  if (!svg) return;
+  svg.querySelectorAll(".sim-route, .sim-dot, .sim-dropmark").forEach((el) => el.remove());
+  _traceEl = null;
+}
+
+/* Grows a persistent dashed polyline along the devices the packet has visited,
+   so the user sees the full path traced out on the map as the dots fly. */
+function traceRoute(svg, pts, color) {
+  if (!pts.length) return;
+  if (!_traceEl) {
+    _traceEl = svgNS("polyline", {
+      fill: "none", stroke: color, "stroke-width": 3,
+      "stroke-linecap": "round", "stroke-linejoin": "round",
+      "stroke-opacity": 0.65, "stroke-dasharray": "7 6", class: "sim-route",
+    });
+    svg.appendChild(_traceEl);
+  }
+  _traceEl.setAttribute("points", pts.map((p) => `${p.x},${p.y}`).join(" "));
+}
+
+function drawDropMark(svg, coord, deviceName, why) {
+  const grp = svgNS("g", { class: "sim-dropmark", transform: `translate(${coord.x},${coord.y})` });
+  const ring = svgNS("circle", { r: 24, fill: "rgba(217,123,111,0.22)", stroke: "#d97b6f", "stroke-width": 2, "stroke-dasharray": "4 3" });
+  const txt = svgNS("text", { y: -26, class: "sim-dropmark-txt" });
+  txt.setAttribute("text-anchor", "middle");
+  txt.style.fill = "#d97b6f";
+  txt.style.fontSize = "11px";
+  txt.style.fontFamily = "var(--mono)";
+  txt.style.fontWeight = "700";
+  txt.textContent = "✖ " + deviceName;
+  grp.appendChild(ring);
+  grp.appendChild(txt);
+  svg.appendChild(grp);
+  setTimeout(() => grp.remove(), 5500 / (simRunner.speed || 1));
 }
 
 async function startSim(wrap, idx) {
@@ -2090,6 +2229,7 @@ async function startSim(wrap, idx) {
 
   const svg = $("topo");
   svg.scrollIntoView({ behavior: "smooth", block: "center" });
+  clearSimSvg();
   svg.querySelectorAll("g.node.flash, g.node.flash-block, g.node.sent").forEach((n) => n.classList.remove("flash", "flash-block", "sent"));
 
   const reachable = data.reachable;
@@ -2100,6 +2240,7 @@ async function startSim(wrap, idx) {
 
   const trace = (data.trace || []).filter((t) => t && t.device);
   const pathNodes = (reachable ? extendPathFromSteps(data.path, data.steps) : data.path.slice());
+  const traced = [];
   let prev = null;
   let blocked = false;
 
@@ -2116,10 +2257,14 @@ async function startSim(wrap, idx) {
     }
     if (prev && prev.coord) {
       simLog(wrap, `→ ${name}${ip ? " (" + ip + ")" : ""}`, "hop");
+      traced.push(coord);
+      traceRoute(svg, traced, color);
       await animateSegment(svg, prev.coord, coord, color, ctl);
       if (ctl !== simCancelCtl) return;
     } else {
       simLog(wrap, `start: ${name}${ip ? " (" + ip + ")" : ""}`, "hop");
+      traced.push(coord);
+      traceRoute(svg, traced, color);
     }
     if (g) {
       g.classList.remove("flash");
@@ -2136,6 +2281,7 @@ async function startSim(wrap, idx) {
       const why = drop.filter ? `blocked by ${drop.filter}` + (drop.rule ? ` (rule: ${drop.rule})` : ` (default ${drop.default})`) : (drop.detail || "dropped");
       simLog(wrap, `✖ dropped at ${name} — ${why}`, "block");
       setSimStatus(wrap, "DROPPED — traffic does not cross the change.");
+      drawDropMark(svg, coord, name, why);
       blocked = true;
       break;
     }
@@ -2156,6 +2302,7 @@ async function startSim(wrap, idx) {
     const why = drop.filter ? `blocked by ${drop.filter}` + (drop.rule ? ` (rule: ${drop.rule})` : ` (default ${drop.default})`) : (drop.detail || "dropped");
     simLog(wrap, `✖ dropped at ${drop.device} (${drop.iface || "iface"}) — ${why}`, "block");
     setSimStatus(wrap, "DROPPED — traffic does not cross the change.");
+    drawDropMark(svg, nodeCoords[drop.device], drop.device, why);
     blocked = true;
   }
 
@@ -2178,6 +2325,135 @@ async function startSim(wrap, idx) {
   simRunner.paused = false;
   wrap._runCtl = null;
   enableSimBtns(wrap);
+  setTimeout(() => {
+    clearSimSvg();
+    svg.querySelectorAll("g.node.flash, g.node.flash-block, g.node.sent").forEach((n) => n.classList.remove("flash", "flash-block", "sent"));
+  }, 3000 / simRunner.speed);
+}
+
+/* ------- blast-radius replay: internet → router → every device ---------- */
+/* When a change blocks flows (e.g. a deny-any-any at the top of the router
+   policy), tell the WHOLE story on the map Packet-Tracer style:
+     1) an inbound packet arrives from the INTERNET (right) to the ROUTER (center)
+     2) the router checks the change, finds it matches, and refuses the traffic
+     3) the refusal BLASTS out from the router to EVERY affected device —
+        red dashed links + red packets flying router → device + an ✖ on each. */
+
+async function runMassSim(wrap) {
+  const sel = wp$(wrap, "sim-flow");
+  if (!sel || !sel.options.length) return;
+  const flows = (wrap._flows || []).filter((f) =>
+    f.after && f.after.reachable === false && (hasPath(f.after) || (f.after.drop && f.after.drop.device)));
+  if (flows.length < 2) { startSim(wrap); return; }
+
+  simRunner.paused = false;
+  simRunner._gateResolve = null;
+  simRunner.speed = (+(wp$(wrap, "sim-speed") && wp$(wrap, "sim-speed").value)) || 1;
+  simCancelCtl++;
+  const ctl = simCancelCtl;
+  wrap._runCtl = ctl;
+  enableSimBtns(wrap);
+  clearSimLog(wrap);
+  clearSimRules(wrap);
+  setSimStatus(wrap, "playing the full scenario: internet → router → every device…");
+
+  const svg = $("topo");
+  svg.scrollIntoView({ behavior: "smooth", block: "center" });
+  clearSimSvg();
+  svg.querySelectorAll("g.node.flash, g.node.flash-block, g.node.sent").forEach((n) => n.classList.remove("flash", "flash-block", "sent"));
+
+  const jobs = [];
+  const seen = new Set();
+  for (const f of flows) {
+    const p = f.after.path || [];
+    const src = p[0] || (f.after.drop && f.after.drop.device);
+    if (!src || seen.has(src)) continue;
+    seen.add(src);
+    jobs.push({ flow: f, src });
+  }
+
+  /* where the packets strike — the device running the blocking filter */
+  const drop = flows.find((f) => f.after && f.after.drop);
+  const d = (drop && drop.after.drop) || {};
+  const why = d.filter ? `blocked by ${d.filter}${d.rule ? " (rule: " + d.rule + ")" : ""}` : (d.detail || "denied");
+  const routerName = d.device;
+  const routerCoord = routerName && nodeCoords[routerName];
+
+  /* the internet node lies on the right side of the map */
+  const m = model();
+  const internetDev = (m.devices || []).find((x) => x.type === "cloud" || x.type === "internet");
+  const netCoord = internetDev && nodeCoords[internetDev.name];
+
+  simLog(wrap, `AFTER the change — replaying ${flows.length} blocked flow(s) across ${jobs.length} device(s)`, "head");
+  simLog(wrap, `the full scenario: internet → ${routerName || "router"} → every device`, "hop");
+
+  /* ---- PHASE 1 · the packet arrives from the internet (right → center) ---- */
+  if (netCoord && routerCoord) {
+    const ingress = svgNS("line", { class: "sim-route sim-block-link", x1: netCoord.x, y1: netCoord.y, x2: routerCoord.x, y2: routerCoord.y,
+      stroke: "#5ec8b2", "stroke-width": 2.5, "stroke-dasharray": "4 7", "stroke-opacity": 0.8 });
+    svg.appendChild(ingress);
+    setTimeout(() => ingress.remove(), 3500 / simRunner.speed);
+    simLog(wrap, `internet → ${routerName}: inbound data reaches the edge of the network`, "hop");
+    await animateSegment(svg, netCoord, routerCoord, "#5ec8b2", ctl);
+    if (ctl !== simCancelCtl) return;
+  }
+
+  /* ---- PHASE 2 · the router checks the change and refuses the traffic ---- */
+  const rg = routerName && svg.querySelector(`g.node[data-device="${CSS.escape(routerName)}"]`);
+  if (rg) rg.classList.add("flash-block");
+  if (routerCoord) drawDropMark(svg, routerCoord, routerName, why);
+  simLog(wrap, `${routerName || "router"} runs the policy: the packet MATCHES your change (${why}) — refused`, "block");
+  setSimStatus(wrap, `router refuses the packet (${why}) · blasting red signals to every device…`);
+  await delay(700 / simRunner.speed);
+  if (ctl !== simCancelCtl) return;
+
+  /* ---- PHASE 3 · red deny-signal BLASTS out to every affected device ---- */
+  await Promise.all(jobs.map((job, i) => massBlockedJob(wrap, svg, job, routerCoord, ctl, i, jobs.length)));
+  if (ctl !== simCancelCtl) return;
+
+  [...seen].slice(0, 200).forEach((n) => simLog(wrap, `✖ ${n} — will not receive data (${why})`, "block"));
+
+  simRunner.paused = false;
+  wrap._runCtl = null;
+  enableSimBtns(wrap);
+  setSimStatus(wrap, `BLOCKED: ${flows.length} flow(s) refused at ${routerName || "the router"} (${why}). Every affected device got the deny signal. No real data was sent.`);
+  setTimeout(() => {
+    clearSimSvg();
+    svg.querySelectorAll("g.node.flash, g.node.flash-block, g.node.sent").forEach((n) => n.classList.remove("flash", "flash-block", "sent"));
+  }, 5000 / simRunner.speed);
+}
+
+async function massBlockedJob(wrap, svg, job, fromCoord, ctl, idx, total) {
+  const { flow, src } = job;
+  const drop = (flow.after || {}).drop || {};
+  const toCoord = nodeCoords[src];
+  if (!fromCoord || !toCoord || fromCoord === toCoord) return;
+
+  await delay(60 + (idx * 200) / (simRunner.speed || 1));
+  if (ctl !== simCancelCtl) return;
+
+  /* red dashed connection: router <-> this device (the broken path) */
+  const line = svgNS("line", { class: "sim-route sim-block-link", x1: fromCoord.x, y1: fromCoord.y, x2: toCoord.x, y2: toCoord.y,
+    stroke: "#d97b6f", "stroke-width": 2.5, "stroke-dasharray": "4 7", "stroke-opacity": 0.85 });
+  svg.appendChild(line);
+
+  const g = svg.querySelector(`g.node[data-device="${CSS.escape(src)}"]`);
+  if (g) g.classList.add("sent");
+
+  /* the red deny-signal flies router → this device */
+  if (!(await simGate(ctl))) return;
+  await animateSegment(svg, fromCoord, toCoord, "#d97b6f", ctl);
+  if (ctl !== simCancelCtl) return;
+
+  /* mark the device as cut off: red flash + ✖ */
+  if (g) { g.classList.remove("sent"); g.classList.add("flash-block"); }
+  if (nodeCoords[src]) drawDropMark(svg, nodeCoords[src], src, "blocked");
+  simLog(wrap, `✖ ${src} — traffic refused`, "block");
+
+  if (idx === total - 1 && drop.device) {
+    const dg = svg.querySelector(`g.node[data-device="${CSS.escape(drop.device)}"]`);
+    if (dg) dg.classList.add("flash-block");
+  }
 }
 
 async function simTraceStep(wrap, entry, ctl) {
@@ -2247,7 +2523,265 @@ function showDecision(wrap, entry) {
 
 function delay(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-/* ---------------- utils ---------------- */
+/* ============================================================
+   TOPOLOGY LIVE-FLOW OVERLAY  (Cisco Packet Tracer style)
+   After validation, draws colored path lines on the map and
+   animates packet dots flying hop-by-hop for every flow.
+   ============================================================ */
+
+let _topoFlowState = null;   // { flows, raf, paused, speed, which, idx }
+
+/* Build the list of flows to animate from a validation report */
+function _buildTopoFlows(report, which) {
+  const flows = [];
+  Object.keys(report.matrix || {}).forEach((k) => {
+    const cell = report.matrix[k];
+    const d = cell[which];
+    if (!d || !d.path || !d.path.length) return;
+    flows.push({
+      key: k,
+      path: d.path.slice(),
+      reachable: d.reachable,
+      drop: d.drop || {},
+      status: d.status || "",
+    });
+  });
+  // blocked flows first so they're immediately visible
+  flows.sort((a, b) => (a.reachable ? 1 : 0) - (b.reachable ? 1 : 0));
+  return flows;
+}
+
+/* Draw static colored path lines for ALL flows at once */
+function _drawPathLines(svg, flows) {
+  svg.querySelectorAll(".flow-path-line").forEach((e) => e.remove());
+  const drawn = new Set();
+  flows.forEach((f) => {
+    const color = f.reachable ? "#4cb782" : "#d97b6f";
+    const opacity = f.reachable ? 0.28 : 0.45;
+    const w = f.reachable ? 2.5 : 3;
+    for (let i = 0; i < f.path.length - 1; i++) {
+      const a = nodeCoords[f.path[i]], b = nodeCoords[f.path[i + 1]];
+      if (!a || !b) continue;
+      const key = [f.path[i], f.path[i + 1]].sort().join("|") + color;
+      if (drawn.has(key)) continue;
+      drawn.add(key);
+      const line = svgNS("line", {
+        x1: a.x, y1: a.y, x2: b.x, y2: b.y,
+        stroke: color, "stroke-width": w,
+        "stroke-opacity": opacity,
+        "stroke-linecap": "round",
+        "stroke-dasharray": f.reachable ? "8 6" : "5 4",
+        class: "flow-path-line",
+      });
+      // insert before nodes so dots appear on top
+      const firstNode = svg.querySelector("g.node");
+      if (firstNode) svg.insertBefore(line, firstNode);
+      else svg.appendChild(line);
+    }
+  });
+}
+
+/* Animate a single packet dot along one flow's path, returns a Promise */
+function _animateFlowPacket(svg, flow, speed) {
+  return new Promise((resolve) => {
+    const path = flow.path;
+    const color = flow.reachable ? "#4cb782" : "#d97b6f";
+    const coords = path.map((n) => nodeCoords[n]).filter(Boolean);
+    if (coords.length < 2) { resolve(); return; }
+
+    const dot = svgNS("circle", {
+      r: 7, fill: color, stroke: "#0b0f14", "stroke-width": 2,
+      class: "flow-packet-dot",
+    });
+    const glow = svgNS("circle", {
+      r: 14, fill: color, "fill-opacity": 0.25,
+      class: "flow-packet-dot",
+    });
+    svg.appendChild(glow);
+    svg.appendChild(dot);
+
+    // total path length for timing
+    let totalLen = 0;
+    for (let i = 0; i < coords.length - 1; i++) {
+      const dx = coords[i + 1].x - coords[i].x, dy = coords[i + 1].y - coords[i].y;
+      totalLen += Math.sqrt(dx * dx + dy * dy);
+    }
+    const baseDur = Math.max(900, Math.min(2800, totalLen * 2.2)) / speed;
+
+    const t0 = performance.now();
+    function frame(now) {
+      if (!_topoFlowState || _topoFlowState.paused) {
+        // park the dot at current position until resumed
+        requestAnimationFrame(frame);
+        return;
+      }
+      const elapsed = now - t0;
+      const p = Math.min(1, elapsed / baseDur);
+      // find which segment we're on
+      let traveled = p * totalLen;
+      let cx = coords[0].x, cy = coords[0].y;
+      for (let i = 0; i < coords.length - 1; i++) {
+        const dx = coords[i + 1].x - coords[i].x, dy = coords[i + 1].y - coords[i].y;
+        const segLen = Math.sqrt(dx * dx + dy * dy);
+        if (traveled <= segLen) {
+          const t = segLen > 0 ? traveled / segLen : 0;
+          cx = coords[i].x + dx * t;
+          cy = coords[i].y + dy * t;
+          break;
+        }
+        traveled -= segLen;
+        cx = coords[i + 1].x; cy = coords[i + 1].y;
+      }
+      dot.setAttribute("cx", cx); dot.setAttribute("cy", cy);
+      glow.setAttribute("cx", cx); glow.setAttribute("cy", cy);
+
+      // flash the node the dot just reached
+      const nodeIdx = Math.min(Math.floor(p * (coords.length - 1)), coords.length - 2);
+      const nodeName = path[nodeIdx + 1];
+      if (nodeName) {
+        const g = svg.querySelector(`g.node[data-device="${CSS.escape(nodeName)}"]`);
+        if (g && !g._flashActive) {
+          g._flashActive = true;
+          g.classList.add(flow.reachable ? "flash" : "flash-block");
+          setTimeout(() => { g.classList.remove("flash", "flash-block"); g._flashActive = false; }, 380);
+        }
+      }
+
+      if (p < 1) { requestAnimationFrame(frame); }
+      else {
+        dot.remove(); glow.remove();
+        // draw a brief "delivered" or "blocked" burst at the last node
+        const last = coords[coords.length - 1];
+        const burst = svgNS("circle", {
+          cx: last.x, cy: last.y, r: 5,
+          fill: "none", stroke: color, "stroke-width": 2.5,
+          class: "flow-packet-dot",
+        });
+        svg.appendChild(burst);
+        let br = 5, bo = 1;
+        function burstFrame() {
+          br += 2.5; bo -= 0.12;
+          burst.setAttribute("r", br);
+          burst.setAttribute("stroke-opacity", Math.max(0, bo));
+          if (bo > 0) requestAnimationFrame(burstFrame);
+          else burst.remove();
+        }
+        requestAnimationFrame(burstFrame);
+        resolve();
+      }
+    }
+    requestAnimationFrame(frame);
+  });
+}
+
+/* Main loop: cycle through all flows continuously */
+async function _topoFlowLoop(state) {
+  const svg = $("topo");
+  if (!svg) return;
+  while (_topoFlowState === state && !state.stopped) {
+    if (state.paused) { await delay(80); continue; }
+    const flow = state.flows[state.idx % state.flows.length];
+    state.idx++;
+    if (!flow) { await delay(100); continue; }
+    // update the overlay bar label
+    const lbl = $("topo-flow-label");
+    if (lbl) {
+      const parts = flow.key.split(" ~ ");
+      lbl.textContent = (parts[0] || "").split("@").pop() + " → " + (parts[1] || "").split("@").pop()
+        + (flow.reachable ? " ✓" : " ✗");
+      lbl.style.color = flow.reachable ? "var(--pass)" : "var(--danger)";
+    }
+    await _animateFlowPacket(svg, flow, state.speed);
+    // small gap between packets
+    await delay(Math.max(60, 320 / state.speed));
+  }
+}
+
+/* Start (or restart) the topology live-flow overlay */
+function startTopoFlowOverlay(report) {
+  stopTopoFlowOverlay();
+  const svg = $("topo");
+  if (!svg) return;
+
+  const which = "after";
+  const flows = _buildTopoFlows(report, which);
+  if (!flows.length) return;
+
+  _drawPathLines(svg, flows);
+
+  const state = { flows, idx: 0, paused: false, speed: 1, which, stopped: false, report };
+  _topoFlowState = state;
+
+  // inject the overlay control bar if not present
+  _ensureOverlayBar(report);
+
+  _topoFlowLoop(state);
+}
+
+function stopTopoFlowOverlay() {
+  if (_topoFlowState) { _topoFlowState.stopped = true; _topoFlowState = null; }
+  const svg = $("topo");
+  if (svg) {
+    svg.querySelectorAll(".flow-path-line, .flow-packet-dot").forEach((e) => e.remove());
+    svg.querySelectorAll("g.node.flash, g.node.flash-block").forEach((g) => g.classList.remove("flash", "flash-block"));
+  }
+  const bar = $("topo-overlay-bar");
+  if (bar) bar.remove();
+}
+
+function _ensureOverlayBar(report) {
+  const wrap = document.querySelector(".topo-wrap");
+  if (!wrap) return;
+  let bar = $("topo-overlay-bar");
+  if (bar) bar.remove();
+
+  bar = document.createElement("div");
+  bar.className = "topo-overlay-bar";
+  bar.id = "topo-overlay-bar";
+  bar.innerHTML = `
+    <span class="ob-live"></span>
+    <span style="color:var(--accent);font-weight:700">LIVE SIM</span>
+    <span id="topo-flow-label" style="min-width:160px">—</span>
+    <button id="ob-after" class="active" title="Show after-change flows">After</button>
+    <button id="ob-before" title="Show before-change flows">Before</button>
+    <button id="ob-pause" title="Pause/resume">⏸</button>
+    <select id="ob-speed" title="Speed">
+      <option value="0.5">0.5×</option>
+      <option value="1" selected>1×</option>
+      <option value="2">2×</option>
+      <option value="4">4×</option>
+    </select>
+    <button id="ob-stop" title="Stop overlay">✕</button>`;
+  wrap.appendChild(bar);
+
+  $("ob-pause").addEventListener("click", () => {
+    if (!_topoFlowState) return;
+    _topoFlowState.paused = !_topoFlowState.paused;
+    $("ob-pause").textContent = _topoFlowState.paused ? "▶" : "⏸";
+  });
+  $("ob-speed").addEventListener("change", (e) => {
+    if (_topoFlowState) _topoFlowState.speed = +e.target.value || 1;
+  });
+  $("ob-stop").addEventListener("click", stopTopoFlowOverlay);
+  $("ob-after").addEventListener("click", () => {
+    if (!_topoFlowState) return;
+    $("ob-after").classList.add("active"); $("ob-before").classList.remove("active");
+    _topoFlowState.flows = _buildTopoFlows(_topoFlowState.report, "after");
+    _topoFlowState.idx = 0;
+    _drawPathLines($("topo"), _topoFlowState.flows);
+  });
+  $("ob-before").addEventListener("click", () => {
+    if (!_topoFlowState) return;
+    $("ob-before").classList.add("active"); $("ob-after").classList.remove("active");
+    _topoFlowState.flows = _buildTopoFlows(_topoFlowState.report, "before");
+    _topoFlowState.idx = 0;
+    _drawPathLines($("topo"), _topoFlowState.flows);
+  });
+}
+
+/* ============================================================ */
+
+
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }

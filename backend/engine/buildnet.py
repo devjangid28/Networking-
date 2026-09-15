@@ -23,7 +23,9 @@ from . import model as M
 
 UPLINK_GW = "203.0.113.1"
 UPLINK_IP = "203.0.113.2"
-CX, CY, RX, RY = 600, 320, 300, 210
+CX, CY = 600, 340
+# Base orbit radii — scaled up for large device counts so nodes never overlap
+BASE_RX, BASE_RY = 340, 240
 
 SERVICE_ICONS = {
     "ssh": "ssh", "telnet": "telnet", "http": "http", "https": "https",
@@ -96,6 +98,14 @@ def build_net(scan: dict, protect: set[str] | None = None) -> tuple[M.Net, dict]
         lan.connected_to = None  # fixed below after neighbor names resolve
         lan_ifaces.append((lan, ip, d))
 
+    # -- orbit geometry (needed before cloud placement) -------------------------
+    others = [(lan, ip, d) for (lan, ip, d) in lan_ifaces if ip != target_ip]
+    n_others = max(len(others), 1)
+    min_arc = 110
+    min_rx = int(n_others * min_arc / (2 * math.pi))
+    RX = max(BASE_RX, min_rx)
+    RY = max(BASE_RY, int(min_rx * 0.72))
+
     # -- uplink -----------------------------------------------------------------
     wan = M.Interface.from_dict("Wan", {"ip": UPLINK_IP, "network": "203.0.113.0/24", "label": "WAN (assumed)", "connected_to": "internet eth0"})
     router.interfaces.append(wan)
@@ -104,15 +114,14 @@ def build_net(scan: dict, protect: set[str] | None = None) -> tuple[M.Net, dict]
     net.devices[cloud.name] = cloud
 
     # -- every other system -----------------------------------------------------
-    others = [(lan, ip, d) for (lan, ip, d) in lan_ifaces if ip != target_ip]
     for idx, (lan, ip, d) in enumerate(others):
         base = d.get("hostname")
         dtype = d.get("type_guess")
-        if dtype not in ("router", "switch", "host", "server", "printer"):
+        if dtype not in ("router", "switch", "host", "server", "printer", "camera", "mobile", "laptop", "phone"):
             dtype = "router" if d.get("is_target") else "host"
         if dtype == "router":
             dtype = "switch"
-        angle = 2 * math.pi * idx / max(len(others), 1)
+        angle = 2 * math.pi * idx / n_others
         dev = M.Device(name=_unique_name(base, used, ip), dtype=dtype,
                        x=CX + RX * math.cos(angle), y=CY + RY * math.sin(angle))
         iface = M.Interface.from_dict("Eth0", {"ip": ip, "network": f"{ip}/32", "label": d.get("vendor", "") or dtype})

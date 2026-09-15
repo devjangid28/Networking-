@@ -35,6 +35,8 @@ SERVICE_PORTS = [
     (53, "dns"), (1433, "mssql"), (3306, "mysql"), (5432, "postgres"),
     (8080, "http-alt"), (8443, "https-alt"),
     (9100, "raw-printer"), (515, "lpd"), (631, "ipp"), (25, "smtp"),
+    # cameras: RTSP streaming + the most common vendor SDK/ONVIF ports
+    (554, "rtsp"), (8554, "rtsp-alt"), (8000, "hikvision-sdk"), (37777, "dahua-sdk"), (34567, "wisenet"),
 ]
 
 # Small but useful MAC OUI -> vendor table. Prefixes are lowercase, colons removed.
@@ -58,6 +60,14 @@ OUI = {
     "1c7ec5": "D-Link", "2001bf": "D-Link", "204e7f": "NETGEAR", "9c21b1": "NETGEAR",
     "98ded0": "Linksys", "00e0bd": "Linksys", "4074e0": "Hikvision", "9ce723": "Hikvision",
     "ecfaec": "MikroTik", "004b6b": "MikroTik", "8032e6": "MikroTik",
+    # cameras (IP CCTV) — the big brands by MAC OUI
+    "4419b6": "Hikvision", "ec2e4e": "Hikvision", "2857be": "Hikvision",
+    "4c8eef": "Hikvision", "c872bc": "Hikvision", "dc6b73": "Hikvision",
+    "3cef8c": "Dahua", "accc8e": "Dahua", "5c48ab": "Dahua", "9c1e95": "Dahua",
+    "00408c": "Axis", "8c8caa": "Axis", "d4c9ef": "Reolink",
+    "2c0100": "Amcrest", "685a5e": "Amcrest", "485d60": "Amcrest",
+    "584466": "Uniview", "28f64d": "Uniview", "00d041": "Uniview",
+    "000786": "Bosch", "001cb7": "Bosch", "0056cd": "Hanwha",
 }
 
 
@@ -366,7 +376,9 @@ def _snmp_probe(sysdescr: str) -> dict:
     gear = {}
     for kw in ("cisco", "juniper", "huawei", "arista", "mikrotik", "fortinet",
                "palo alto", "zyxel", "d-link", "hp ", "hewlett", "brother",
-               "canon", "epson", "ricoh", "xerox", "lexmark", "dell", "netgear"):
+               "canon", "epson", "ricoh", "xerox", "lexmark", "dell", "netgear",
+               "hikvision", "dahua", "reolink", "axis", "uniview", "amcrest",
+               "foscam", "wisenet", "hanwha", "vstarcam", "zkteco", "lorex"):
         if kw in d:
             gear["vendor"] = kw.strip().title()
             break
@@ -383,11 +395,32 @@ def _snmp_probe(sysdescr: str) -> dict:
 # Type inference                                                            #
 # --------------------------------------------------------------------------- #
 
-def guess_type(ip: str, vendor: str, services: list[dict], mac: str, snmp: dict, target_ip: str) -> str:
+def guess_type(ip: str, vendor: str, services: list[dict], mac: str, snmp: dict, target_ip: str, hostname: str = "") -> str:
     ports = {s["port"] for s in services}
     dv = vendor.lower()
+    hn = (hostname or "").lower()
     if ip == target_ip:
         return "router"
+
+    # ---- camera signatures (checked first so they beat the generic fallbacks) ----
+    # RTSP streaming ports are the definitive camera fingerprint.
+    if 554 in ports or 8554 in ports:
+        return "camera"
+    # Vendor SDK / ONVIF discovery ports are strong camera-only signals.
+    if 8000 in ports or 37777 in ports or 34567 in ports:
+        if not ({135, 139, 445, 3389} & ports):
+            return "camera"
+    cam_vendors = ("hikvision", "dahua", "axis", "reolink", "amcrest", "foscam",
+                   "wyze", "arlo", "hanwha", "wisenet", "bosch", "uniview",
+                   "zkteco", "annke", "lorex", "swann", "eufy", "vstarcam",
+                   "tessafe", "cleverloop", "empiretec", "safire", "vipcam",
+                   "dvrtime", "ipcamera", "znj")
+    if any(k in dv or k in hn for k in cam_vendors):
+        return "camera"
+    # Typical camera hostnames: IPC-xxx, CAM-01, DVR/nvr, CCTV webcam
+    if re.search(r"(^|[^a-z0-9_-])(ipc[-_ ]?[0-9a-z]*|cam[-_ ]?[0-9]*|dvr|cctv|webcam)([^a-z0-9_-]|$)", hn):
+        return "camera"
+
     if not services and not snmp:
         return "host"
     if 9100 in ports or 515 in ports or 631 in ports:
@@ -396,13 +429,18 @@ def guess_type(ip: str, vendor: str, services: list[dict], mac: str, snmp: dict,
         return {"printer": "printer", "switch": "switch"}.get(snmp["kind"], "router")
     if any(k in dv for k in ("brother", "canon", "epson", "ricoh", "xerox", "lexmark", "hp")):
         return "printer"
+    # mobile/phone: Apple (iPhone/iPad), Samsung, OnePlus, Xiaomi, Oppo, Vivo, Realme
+    if any(k in dv for k in ("apple", "samsung", "oneplus", "xiaomi", "oppo", "vivo", "realme", "motorola", "nokia")):
+        # Apple MACs with no server ports are phones/tablets
+        if not ({22, 80, 443, 445, 3389} & ports):
+            return "mobile"
     if any(k in dv for k in ("cisco", "juniper", "huawei", "arista", "mikrotik",
                              "fortinet", "tp-link", "d-link", "netgear", "linksys")):
         return "switch" if ports <= {80, 443, 8080} else "router"
     if 135 in ports and 139 in ports and 445 in ports:
         return "server" if {80, 443} & ports else "host"
     if 3389 in ports or 5900 in ports:
-        return "host"
+        return "laptop"
     if 80 in ports or 443 in ports or 8080 in ports:
         return "server"
     return "host"
@@ -510,7 +548,7 @@ def scan(target: str, community: str = "public", do_ping: bool = True, max_devic
                 vendor = gear["vendor"]
             if not mac:
                 mac = f"snmp:{ip}"
-        dtype = guess_type(ip, vendor, services, mac, _snmp_probe(snmp_basic.get(".1.3.6.1.2.1.1.1.0", "")), target_ip)
+        dtype = guess_type(ip, vendor, services, mac, _snmp_probe(snmp_basic.get(".1.3.6.1.2.1.1.1.0", "")), target_ip, names.get(ip, ""))
         result["devices"].append({
             "ip": ip,
             "mac": mac,

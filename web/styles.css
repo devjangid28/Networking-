@@ -423,6 +423,36 @@ table.matrix td.cell { text-align: center; min-width: 86px; }
 .sim-decision.ok { color: var(--pass); }
 .sim-decision.block { color: var(--danger); }
 
+/* ---------- topology live-flow overlay (Packet Tracer style) ---------- */
+.topo-overlay-bar {
+  position: absolute; bottom: 44px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 8px;
+  background: rgba(11,15,20,0.92); border: 1px solid var(--border);
+  border-radius: 999px; padding: 6px 14px;
+  font-family: var(--mono); font-size: 11px; color: var(--dim);
+  z-index: 6; white-space: nowrap; backdrop-filter: blur(4px);
+  box-shadow: 0 4px 18px rgba(0,0,0,0.5);
+}
+.topo-overlay-bar button {
+  background: none; border: 1px solid var(--border); border-radius: 6px;
+  color: var(--dim); font-family: var(--mono); font-size: 11px;
+  padding: 3px 9px; cursor: pointer;
+}
+.topo-overlay-bar button:hover { color: var(--accent); border-color: var(--accent); }
+.topo-overlay-bar button.active { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
+.topo-overlay-bar .ob-live { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pulse 1.3s infinite; }
+.topo-overlay-bar select {
+  background: transparent; border: 1px solid var(--border); border-radius: 6px;
+  color: var(--dim); font-family: var(--mono); font-size: 11px; padding: 3px 6px;
+}
+.flow-path-line { pointer-events: none; animation: marchAnts 1.2s linear infinite; }
+@keyframes marchAnts { to { stroke-dashoffset: -20; } }
+.flow-packet-dot { pointer-events: none; }
+.node-hit-badge {
+  font-family: var(--mono); font-size: 9px; font-weight: 700;
+  fill: #fff; pointer-events: none;
+}
+
 /* ---------- agent (account) mode ---------- */
 .agent-root { display: flex; flex-direction: column; gap: 10px; }
 .agent-row { display: flex; gap: 8px; align-items: center; }

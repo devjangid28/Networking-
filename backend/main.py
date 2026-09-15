@@ -14,6 +14,7 @@ human proposes a change, NetProof answers "safe / unsafe, and here's proof".
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import threading
 import time
@@ -401,6 +402,7 @@ def network_info(org: str = "") -> dict:
 
 @app.get("/api/model")
 def model_info(mode: str = "demo", org: str = "", protect: str = "") -> dict:
+    global _SCAN_NET, _SCAN_META
     if mode == "scan" and protect:
         # Owner ticked services on the last live scan: rebuild the policy from the
         # RETAINED discovery result with THAT opt-in set — no rescan needed. Empty
