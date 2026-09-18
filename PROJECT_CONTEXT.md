@@ -66,8 +66,11 @@ alike. Any agent or any human proposes a change; NetProof answers
 - **Platform:** Windows 11, PowerShell 5.1, Python 3.12. Development happens
   with the opencode CLI in `C:\Users\DK\Desktop\Networking`. The project lives
   in the `netproof/` subfolder.
-- **No git repo** is initialized (as of writing). Files live directly under
-  `netproof/`.
+- **Git repo:** initialized 2026-09-18 inside `netproof/` (this living doc plus
+  the current codebase were committed as a baseline checkpoint
+  `c01ee31`). `.gitignore` keeps `.env`, `backend/data/*.db*`, `lib/venv/` and
+  `__pycache__/` out. Commit at meaningful checkpoints (one clear message per
+  fix / feature).
 - **Bootstrap (one-time):** `.\bootstrap.ps1` creates `lib\venv` and installs
   `requirements.txt`. The interpreter is `lib\venv\Scripts\python.exe`.
 - **Run locally:** `.\run.ps1` → serves the web UI + API on
@@ -97,8 +100,9 @@ alike. Any agent or any human proposes a change; NetProof answers
 
 ## 4. The journey — how the project grew to this point (A to Z)
 
-Reconstructed from the codebase (there is no git history in this folder, so
-this is the story the code itself tells). Phases are approximate and overlap.
+Reconstructed from the codebase (git history exists from 2026-09-18 but the
+story below is older than the oldest commit, so it is the tale the code tells).
+Phases are approximate and overlap.
 
 ### Phase 0 — the seed: differential validation (v0.1.0-era core)
 - `engine/model.py`: a declarative YAML network model (devices, interfaces,
@@ -436,7 +440,8 @@ Environment variables (`NETPROOF_*`): `ADMIN_PASS` (required), `ADMIN_USER`,
 
 ## 10. Frontend (web/)
 
-Single-page dashboard, vanilla JS, no framework/build step. Three modes via the
+Single-page dashboard, vanilla JS, no framework/build step (`index.html` +
+`styles.css` + `app.js`, cache-busted as `app.js?v=0.8.0`). Three modes via the
 mode pills in the header:
 - **Demo** — preloaded `acme_office.yaml` sample (banner warns it is demo data).
 - **Live** — "scan this LAN": target IP/CIDR + "I own this network" consent
@@ -449,6 +454,32 @@ Sections: Overview (hero, verdict summary), Systems & Policy (topology,
 confirmed/inferred badges), Change & Result (builder + verdict/findings/
 requirements/matrix), Settings (options, audit, admin). Login/logout and
 role-aware UI in the top bar.
+
+### UX affordances (all verified live on 2026-09-18)
+- **Glossary tooltips** — every technical term rendered through `glossHtml()`
+  gets a `data-gloss` tooltip (`GLOSSARY` map in `app.js`; hover/click/keyboard
+  shows a floating card). Covers acl, bgp, ospf, vlan, nat, guardrail, zone,
+  snmp, intent, verdict, confirmed, inferred, critical, warning.
+- **Simple / expert view toggle** — header `#ux-switch`; simple hides the
+  advanced builder fields and shows plain-English hints, expert exposes every
+  control. Persisted in `sessionStorage` (`applyUxMode`/`resumeUxMode`).
+- **First-run walkthrough** — a 4-step overlay (`showWalkthrough`) opens on
+  first load unless dismissed; "Show guide" (`#tour-btn`) re-opens it; dismissal
+  persisted in `localStorage`.
+- **Footgun confirmation dialog** — before running validation, `riskSummary()`
+  detects guardrail-critical findings, remove/replace changes, and default-route
+  repoints and asks the user to confirm via an in-DOM `confirmRisk()` dialog
+  (Cancel / Escape, or "Yes — run the dry run"). Validation always stays a dry
+  run.
+- **Device-inspect drawer** — clicking a device (`renderDetail`) opens the
+  right-hand drawer (`#dev-detail`) with identity, interfaces, routes, filters
+  and policy entries; confirmed vs inferred entries carry distinct badges
+  (`srcBadge`), and source/destination fields reuse the glossary tooltips.
+
+Verification: on 2026-09-18 the real `index.html` + `app.js` (fetched from a
+running server) were executed in a jsdom harness against the live backend — 27
+behavioral assertions passed (hover tooltip, mode toggle both ways, walkthrough
+open/dismiss/re-open, risk dialog yes/cancel/escape, direct function calls).
 
 ---
 
@@ -481,12 +512,22 @@ script for exercising the agent-report path outside pytest.
 
 Solid, internally consistent v0.3.0: 13 presets, differential + stateful
 validation, intent + guardrails, multi-tenant agent model, audit/replay,
-metrics, TLS deployment, MCP interface. Obvious next candidates (not yet built):
+metrics, TLS deployment, MCP interface.
+
+**Bug-status reconciliation (2026-09-18, verified against the current code):**
+- *"`intent.py` has an `or True` bug"* — **not present.** `grep` for `or True` /
+  `and True` in `backend/engine/intent.py` returns nothing.
+- *"`validate.py` always marks findings critical"* — **not present.** The module
+  emits mixed severity: 23 `critical`, 19 `warning`, 16 `info` findings across
+  data-plane and control-plane checks (`_finding(sev, ...)` / `_cp_finding`).
+
+Obvious next candidates (not yet built):
 - Batfish-class features at depth (e.g. realistic firewall/NAT interaction
   beyond the current scoping).
 - YAML/JSON export of a full validation "proof bundle" for external audit.
 - More router dialects / vendors in `parse_router_text`.
-- Automated CI (this folder is not a git repo yet) and packaging (PyPI / OCI).
+- Automated CI (git repo initialized 2026-09-18; no CI added yet) and
+  packaging (PyPI / OCI).
 - Distributed/on-host scan worker so huge networks don't die on one process.
 
 **Ask any AI you give this file to:** critique the engine's conservative rules,
@@ -497,5 +538,14 @@ frontend/architecture split; then propose the single highest-value next feature.
 
 ## 14. Changelog (updated after every change)
 
+- **2026-09-18** — Context-doc reconciliation session: initialized the git repo
+  in `netproof/` and committed `PROJECT_CONTEXT.md` (baseline `c01ee31`);
+  verified all frontend UX affordances (glossary tooltips, simple/expert view,
+  first-run walkthrough, footgun confirmation dialog) by executing the real
+  `index.html` + `app.js` against a live server in a jsdom harness (27/27
+  assertions); confirmed the `intent.py or True` and
+  `validate.py always-critical` bugs are **not** present in the current code
+  (grep + severity counts). Sections 3/4/10/13 refreshed. No functional code
+  changes.
 - **2026-09-18** — Created this living context document from a full codebase
   review (version 0.3.0). No functional changes to the code.
