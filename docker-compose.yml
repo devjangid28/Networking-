@@ -28,6 +28,10 @@ services:
       - NETPROOF_ORG_DIR=${NETPROOF_ORG_DIR:-/app/backend/data/orgs}
       # Comma-separated; unset = same-origin only (recommended).
       - NETPROOF_ALLOWED_ORIGINS=${NETPROOF_ALLOWED_ORIGINS:-}
+      # Enables the app-side terminal-TLS enforcement (HTTP->HTTPS 307, HSTS,
+      # Secure cookies) when the production Caddy profile sets it. Optional:
+      # empty = plain-HTTP dev mode, exactly like leaving it out entirely.
+      - NETPROOF_DOMAIN=${NETPROOF_DOMAIN:-}
     volumes:
       - netproof-data:/app/backend/data
     healthcheck:

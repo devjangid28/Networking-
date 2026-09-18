@@ -524,6 +524,10 @@ a scratch/diagnostic script for exercising the agent-report path outside pytest.
 - **Docker:** `docker compose up --build` (profile default) → app on :8000,
   data volume persisted. `docker compose --profile production up` → Caddy on
   80/443 with automatic Let's Encrypt certs for `NETPROOF_DOMAIN`.
+  `NETPROOF_DOMAIN` is also propagated into the app container (compose
+  `netproof.environment`) so the terminal-TLS enforcement (HTTP→HTTPS 307, HSTS,
+  Secure cookies) actually activates in the production profile — otherwise only
+  Caddy's own redirect would fire.
 - Container entrypoint requires `NETPROOF_ADMIN_PASS`; runs as unprivileged
   user; healthcheck on `/health`. See `DEPLOY.md` for the hardening checklist.
 
@@ -561,6 +565,17 @@ frontend/architecture split; then propose the single highest-value next feature.
 
 ## 14. Changelog (updated after every change)
 
+- **2026-09-18** — **S4 static deployment review.** Statically verified the
+  `Caddyfile` (site block, `reverse_proxy netproof:8000`), `Dockerfile`
+  (non-root `netproof` user, admin-pass guard, healthcheck) and
+  `docker-compose.yml` (profiles, volumes, `:?` required-env guards). **Fixed a
+  real gap found during review:** `NETPROOF_DOMAIN` was only wired to the Caddy
+  service, so the app-side terminal-TLS enforcement (`main.py` HTTP→HTTPS 307 +
+  HSTS + Secure cookies) never activated in the production profile — added
+  `NETPROOF_DOMAIN=${NETPROOF_DOMAIN:-}` to the `netproof` service env. Compose
+  YAML re-parsed OK (PyYAML). Clean-build / docker-compose-up proof and a real
+  Let's Encrypt certificate remain **unverifiable in this environment** (no
+  Docker binary; a real cert needs a real domain with DNS A/AAAA on 80/443).
 - **2026-09-18** — **Target Intelligence Bundle (S3).** New
   `backend/engine/intel.py` (`target_intelligence`) + `audit.list_verdicts_for_target`
   assemble a per-device dossier: identity (with its source), discovery detail
