@@ -14,8 +14,12 @@ human proposes a change, NetProof answers "safe / unsafe, and here's proof".
 from __future__ import annotations
 
 import datetime
+import ipaddress
 import json
 import os
+import re
+import socket
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -423,6 +427,70 @@ def health(request: Request) -> dict:
     }
 
 
+@app.get("/api/gateway")
+def default_gateway(request: Request) -> dict:
+    """Suggest the current default gateway (the router IP of the network this
+    backend is on). Read-only, public: it only reveals the gateway of the host
+    serving the app to users already on that same network/AUI. Returns an empty
+    list when the gateway cannot be determined (VPNs, containers, edge cases).
+    """
+    candidates = _detect_default_gateways()
+    return {"gateways": candidates, "client_ip": request.client.host if request.client else None}
+
+
+def _detect_default_gateways() -> list[str]:
+    """Best-effort cross-platform default-gateway detection. Order matters: the
+    first entry is the strongest candidate (lowest route metric)."""
+    got: list[str] = []
+    try:
+        if os.name == "nt":
+            out = subprocess.run(
+                ["route", "print", "0.0.0.0"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+            # IPv4 "0.0.0.0 ... 0.0.0.0 <gateway> <iface> <metric>" rows.
+            # Route & metric columns are fixed-width in the v4 table; lowest
+            # metric wins. The interface column may be "Default" or an IP.
+            rows = []
+            for line in out.splitlines():
+                m = re.match(
+                    r"\s*0\.0\.0\.0\s{4,}0\.0\.0\.0\s{4,}(\S+)\s+(?:\S+)\s+(\d+)\s*$", line
+                )
+                if m:
+                    rows.append((int(m.group(2)), m.group(1)))
+            seen = set()
+            for _, gw in sorted(rows):
+                if gw not in seen:
+                    seen.add(gw)
+                    got.append(gw)
+        else:
+            with open("/proc/net/route", "r", encoding="utf-8") as fh:
+                for line in fh.read().splitlines()[1:]:
+                    row = line.strip().split()
+                    if row and _hex_ip(row[1]) == 0 and _hex_ip(row[2]) == 0:
+                        gw = str(ipaddress.IPv4Address(int(row[2], 16)))
+                        if gw not in got:
+                            got.append(gw)
+    except Exception:
+        return []
+    # Fall back to the connection's local source IP only if we found nothing.
+    if not got:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            net = ipaddress.ip_network(f"{local_ip}/24", strict=False)
+            got = [str(net.network_address + 1)]
+        except Exception:
+            pass
+    return got
+
+
+def _hex_ip(value: str) -> int:
+    return int(value, 16)
+
+
 @app.post("/api/scan")
 def scan_endpoint(req: ScanRequest, request: Request, info: dict = Depends(require_session)) -> dict:
     """Discover systems on the segment of `target`, then build a model from it.
@@ -772,6 +840,46 @@ def network_info(org: str = "", request: Request = None) -> dict:
     info["presets"] = ALL_PRESETS
     info["source"] = "demo"
     info["mode"] = "demo"
+    return info
+
+
+@app.get("/api/org/network")
+def org_network_by_key(api_key: str | None = Header(default=None, alias="X-NetProof-Key"), request: Request = None) -> dict:
+    """Fetch an account's network using ONLY its API key (no session needed).
+    Returns the same payload the dashboard uses, so pasting an account key in
+    the Agent tab renders that managed network directly."""
+    if request and not ratelimit.allow(request, "org_network", 120, 60):
+        raise HTTPException(status_code=429, detail="rate limit: 120 per minute")
+    org = tenant_store.get_org_by_api_key(api_key or "")
+    if org is None:
+        raise HTTPException(status_code=401, detail="invalid or missing X-NetProof-Key")
+    entry = _agent_net(org["id"])
+    if entry is None:
+        return {
+            "source": "none",
+            "mode": "agent",
+            "org": org["id"],
+            "org_name": org["name"],
+            "onboarding": True,
+            "description": "No agent report yet. Install the NetProof agent inside the network and run it with this account's API key — the dashboard never scans on its own.",
+        }
+    info = _network_info(entry["net"], entry["net"].name)
+    info["description"] = entry["net"].description
+    info["presets"] = ALL_PRESETS
+    info["source"] = "agent"
+    info["mode"] = "agent"
+    info["org"] = org["id"]
+    info["org_name"] = org["name"]
+    info["reported_at"] = entry["at"]
+    info["confirmations"] = confirm_counts(entry["net"])
+    info["agent_changes"] = entry["changes"]
+    info["config_sources"] = entry.get("config_sources") or []
+    info["scan_devices"] = entry["scan"].get("devices") or []
+    info["scan_summary"] = {
+        "subnet": entry["scan"].get("network"),
+        "target": entry["scan"].get("target"),
+        "devices": len(entry["scan"].get("devices") or []),
+    }
     return info
 
 

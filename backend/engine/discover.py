@@ -266,9 +266,9 @@ def probe_ports_many(items: list[tuple[str, tuple[int, str]]], max_open: int = 8
 def hostname_of(ip: str) -> str:
     nb = ""
     if os.name == "nt":
-        nb = _run_hidden(["nbtstat", "-A", ip], timeout=2.5)
+        nb = _run_hidden(["nbtstat", "-A", ip], timeout=1.5)
     else:
-        nb = _run_hidden(["nmblookup", "-A", ip], timeout=2.5)
+        nb = _run_hidden(["nmblookup", "-A", ip], timeout=1.5)
     m = re.search(r"<00>\s+UNIQUE\s+(\S+)", nb)
     if m:
         return m.group(1)
@@ -276,10 +276,23 @@ def hostname_of(ip: str) -> str:
 
 
 def _rdns(ip: str) -> str:
-    try:
-        return socket.gethostbyaddr(ip)[0]
-    except Exception:
-        return ""
+    """Bounded reverse DNS. `socket.gethostbyaddr` has no deadline on Windows
+    and can block for many seconds per IP, which alone blew the scan timeout on
+    segments without a working PTR service - so always run it inside a worker
+    thread and refuse to wait longer than _RDNS_TIMEOUT_S below."""
+    deadline_s = getattr(_rdns, "_deadline", 1.2)
+    box: dict = {}
+
+    def _lookup():
+        try:
+            box["name"] = socket.gethostbyaddr(ip)[0]
+        except Exception:
+            box["name"] = ""
+
+    t = threading.Thread(target=_lookup, daemon=True)
+    t.start()
+    t.join(deadline_s)
+    return box.get("name") or ""
 
 
 # --------------------------------------------------------------------------- #
@@ -696,7 +709,13 @@ def scan(target: str, community: str = "public", do_ping: bool = True, max_devic
     def _name(ip: str) -> str:
         pai = {s["port"] for s in probes.get(ip, [])}
         if ip == target_ip or ({135, 139, 445, 3389, 5900} & pai) or not pai:
-            return hostname_of(ip) or rdns.get(ip, "")
+            # The target router and anything with a shell/PC-style port get the
+            # full NetBIOS try; everything else (printers, cameras, IoT) only
+            # reads the already-bounded reverse-DNS cache - a NetBIOS block per
+            # host is exactly what used to blow the scan timeout.
+            if ip == target_ip or ({135, 139, 445, 3389, 5900} & pai):
+                return hostname_of(ip) or rdns.get(ip, "")
+            return rdns.get(ip, "")
         return rdns.get(ip, "")
 
     with ThreadPoolExecutor(max_workers=20) as ex:

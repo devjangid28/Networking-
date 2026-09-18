@@ -218,7 +218,8 @@ def build_net(scan: dict, protect: set[str] | None = None) -> tuple[M.Net, dict]
             # open" until ticked - no silent 10-rule wall, nothing auto-guarded.
             if protect is not None and f"{ip}:{port}" not in protect:
                 continue
-            base = (d.get("hostname") or str(ip)).split(".")[0].strip().lower()[:24]
+            hn = (d.get("hostname") or "").strip().lower()
+            base = (hn.split(".")[0] if hn else str(ip))[:24]
             name = f"svc-{base}-{port}"
             n = 1
             while name in req_names:

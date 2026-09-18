@@ -114,6 +114,40 @@ let report = null;
 let nodeCoords = {};   // device name -> {x,y}
 let deviceByZone = {}; // zone name -> device name
 let scanByIp = {};     // raw scan device lookup by ip
+let highlightSvcKey = ""; // last service checkbox tapped, "ip:port"
+
+const SERVICE_INFO = {
+  smb: "Windows file sharing (SMB/CIFS), port 445",
+  rpc: "Windows RPC endpoint mapper, port 135",
+  netbios: "NetBIOS name service, port 139/137",
+  ssh: "Secure Shell remote administration, port 22",
+  telnet: "Telnet remote administration (plaintext), port 23",
+  http: "HTTP web service, port 80",
+  https: "HTTPS web service, port 443",
+  rdp: "Remote Desktop, port 3389",
+  vnc: "VNC remote desktop, port 5900",
+  ftp: "FTP file transfer, port 21",
+  tftp: "TFTP trivial file transfer, port 69",
+  dns: "DNS name resolution, port 53",
+  ntp: "Network Time Protocol, port 123",
+  dhcp: "DHCP addressing, port 67/68",
+  mysql: "MySQL database, port 3306",
+  postgres: "PostgreSQL database, port 5432",
+  mssql: "MS SQL database, port 1433",
+  smtp: "SMTP email delivery, port 25",
+  rtsp: "RTSP video streaming (cameras), port 554",
+  "rtsp-alt": "RTSP alternate stream, port 8554",
+  "dahua-sdk": "Dahua camera SDK, port 37777",
+  "hikvision-sdk": "Hikvision camera SDK, port 8000",
+  wisenet: "Wisenet camera SDK, port 34567",
+  "http-alt": "HTTP alternate, port 8080",
+  "https-alt": "HTTPS alternate, port 8443",
+  "raw-printer": "Raw printer protocol, port 9100",
+  lpd: "Line printer daemon, port 515",
+  ipp: "Internet printing protocol, port 631",
+  snmp: "SNMP network management, port 161",
+  syslog: "Syslog, port 514",
+};
 
 init();
 
@@ -217,6 +251,8 @@ async function init() {
   await checkAuth();
   await setMode(resumeMode());
   wireScan();
+  wireMiniScan();
+  refreshGatewaySuggestions();
   applyUxMode(resumeUxMode());
   maybeShowWalkthrough();
   const dd = $("demo-dismiss");
@@ -271,6 +307,8 @@ function renderAll() {
   const $scan = $("scan-card"), $agent = $("agent-card");
   if ($scan) $scan.hidden = MODE === "agent";
   if ($agent) $agent.hidden = MODE !== "agent";
+  const mini = $("mini-scan-wrap");
+  if (mini) mini.hidden = MODE === "agent";
   const devCard = $("devices-card");
   if (MODE === "scan" && SCAN && (SCAN.devices || []).length) {
     renderDevices(SCAN.devices);
@@ -288,6 +326,7 @@ function renderAll() {
   fillAddressLists();
   applyChangeTypeFilter();
   refreshHint();
+  renderOverviewStrip();
   if (NET && NET.presets) {
     const ok = MODE === "demo";
     $("preset").disabled = !ok;
@@ -693,7 +732,12 @@ function renderDetail(dev, raw) {
     if (raw.hostname) ext += kv("hostname", raw.hostname, true);
     if (raw.services && raw.services.length) {
       ext += `<div class="dk-sec">open services</div><div class="dk-chips">` +
-        raw.services.map((s) => `<span class="srv-chip">${s.port}/<b>${s.service}</b></span>`).join("") + `</div>`;
+        raw.services.map((s) => {
+          const key = (raw.ip || "") + ":" + s.port;
+          const hl = key === highlightSvcKey;
+          const prot = (MODE === "scan" && protectSel.has(key)) ? ` <span class="prot-badge">protected</span>` : "";
+          return `<span class="srv-chip${hl ? " hl" : ""}">${s.port}/<b>${s.service}</b>${prot}</span>`;
+        }).join("") + `</div>`;
     }
     if (raw.snmp && (raw.snmp.sysName || raw.snmp.sysDescr)) {
       const parts = [];
@@ -795,51 +839,126 @@ function renderRequirements(reqs, result) {
 }
 
 /* ---------------- scan ---------------- */
+const GATEWAY_SUGGEST_KEY = "netproof-gateway-suggests";
+
+function fillGatewaySuggestions() {
+  const dl = $("gateway-suggest"), hint = $("scan-target-hint");
+  if (!dl) return;
+  let ips = [];
+  try { ips = JSON.parse(localStorage.getItem(GATEWAY_SUGGEST_KEY) || "[]"); } catch (e) {}
+  if (ips.length) {
+    if (hint) hint.textContent = `Suggested: ${ips[0]} — tap the field and pick it.`;
+  } else {
+    if (hint) hint.textContent = "Tap the field to pick the current router (gateway) of this network.";
+  }
+  dl.innerHTML = ips.map((ip) => `<option value="${esc(ip)}"></option>`).join("");
+}
+
+async function refreshGatewaySuggestions() {
+  try {
+    const r = await fetch("/api/gateway", { headers: { "Accept": "application/json" } });
+    if (!r.ok) return;
+    const data = await r.json();
+    const ips = (data.gateways || []).filter((x) => /^\d{1,3}(\.\d{1,3}){3}$/.test(x));
+    if (!ips.length) return;
+    const seen = new Set();
+    let all = [];
+    try { all = JSON.parse(localStorage.getItem(GATEWAY_SUGGEST_KEY) || "[]"); } catch (e) {}
+    ips.concat(all).forEach((ip) => { if (!seen.has(ip)) { seen.add(ip); all.push(ip); } });
+    localStorage.setItem(GATEWAY_SUGGEST_KEY, JSON.stringify(all.slice(0, 10)));
+    const t = $("scan-target");
+    if (t && !t.value) t.placeholder = ips[0];
+    fillGatewaySuggestions();
+  } catch (e) {}
+}
+
+async function execScan({ target, community, consent, extra, btn, btnLabel, note }) {
+  if (!target) { toast("Enter the router/server IP or CIDR to scan.", true); return; }
+  btn.disabled = true;
+  btn.textContent = "Running… discover + read config";
+  note.textContent = "Scanning — this can take 10-30s depending on subnet size…";
+  clearSuggestions();
+  try {
+    if (!consent) { toast("Tick the authorization box first.", true); btn.disabled = false; btn.textContent = btnLabel; return; }
+    const body = Object.assign(
+      { target, community: community || "public", ping: true, consent: !!consent },
+      extra || {}
+    );
+    const res = await fetch("/api/scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (res.status === 401) {
+      requireLogin();
+      throw new Error("you must sign in first — use the Login button (top right)");
+    }
+    if (!res.ok) throw new Error((await res.json()).detail || "scan failed");
+    SCAN = await res.json();
+    await loadLiveModel();
+    const cfg = (SCAN.config_sources || []).length ? ` · rules imported (${(SCAN.config_sources || []).join(" + ")})` : "";
+    note.textContent = `Found ${SCAN.devices.length} live system(s) on ${SCAN.network} in ${SCAN.seconds}s${cfg}. ` + (SCAN.notes || []).slice(0, 2).join(" ");
+    toast(`Scan complete — ${SCAN.devices.length} system(s) discovered on ${SCAN.network}`);
+  } catch (e) {
+    /* nothing found / scan failed: never leave the previous network's
+       suggestions behind, or the UI looks like it reports the wrong net */
+    const needAuth = /sign in/i.test(e.message);
+    note.textContent = needAuth
+      ? "Sign in first (Login, top right), then run the discovery again."
+      : "No devices found on that network — nothing to show. The previous details were cleared.";
+    const devCard = $("devices-card");
+    if (devCard) devCard.hidden = true;
+    toast("Scan failed: " + e.message, true);
+  }
+  btn.disabled = false;
+  btn.textContent = btnLabel;
+}
+
 function wireScan() {
-  $("scan-form").addEventListener("submit", async (ev) => {
+  const targetInput = $("scan-target");
+  if (targetInput) {
+    targetInput.addEventListener("focus", refreshGatewaySuggestions);
+  }
+  const form = $("scan-form");
+  if (!form) return;
+  form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     const target = $("scan-target").value.trim();
     if (!target) { toast("Enter the router/server IP or CIDR to scan.", true); return; }
-    const btn = $("scan-btn");
-    btn.disabled = true;
-    btn.textContent = "Running… discover + read config";
-    $("scan-note").textContent = "Scanning — this can take 10-30s depending on subnet size…";
-    clearSuggestions();
-    try {
-      const body = { target, community: $("scan-community").value.trim() || "public", ping: true, consent: !!($("scan-consent") && $("scan-consent").checked) };
-      const file = $("scan-cfg-file").files && $("scan-cfg-file").files[0];
-      if (file) body.config_file = await file.text();
-      const sshUser = ($("scan-ssh-user") && $("scan-ssh-user").value.trim()) || "";
-      const sshPass = ($("scan-ssh-pass") && $("scan-ssh-pass").value) || "";
-      if (sshUser || sshPass) body.ssh = { user: sshUser, password: sshPass };
-      if (!body.consent) { toast("Tick the authorization box first.", true); btn.disabled = false; btn.textContent = "Run"; return; }
-      const res = await fetch("/api/scan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (res.status === 401) {
-        requireLogin();
-        throw new Error("you must sign in first — use the Login button (top right)");
-      }
-      if (!res.ok) throw new Error((await res.json()).detail || "scan failed");
-      SCAN = await res.json();
-      await loadLiveModel();
-      const cfg = (SCAN.config_sources || []).length ? ` · rules imported (${(SCAN.config_sources || []).join(" + ")})` : "";
-      $("scan-note").textContent = `Found ${SCAN.devices.length} live system(s) on ${SCAN.network} in ${SCAN.seconds}s${cfg}. ` + (SCAN.notes || []).slice(0, 2).join(" ");
-      toast(`Scan complete — ${SCAN.devices.length} system(s) discovered on ${SCAN.network}`);
-    } catch (e) {
-      /* nothing found / scan failed: never leave the previous network's
-         suggestions behind, or the UI looks like it reports the wrong net */
-      const needAuth = /sign in/i.test(e.message);
-      $("scan-note").textContent = needAuth
-        ? "Sign in first (Login, top right), then run the discovery again."
-        : "No devices found on that network — nothing to show. The previous details were cleared.";
-      $("devices-card").hidden = true;
-      toast("Scan failed: " + e.message, true);
-    }
-    btn.disabled = false;
-    btn.textContent = "Run";
+    const body = { target, community: $("scan-community").value.trim() || "public", consent: !!($("scan-consent") && $("scan-consent").checked) };
+    const file = $("scan-cfg-file").files && $("scan-cfg-file").files[0];
+    if (file) body.config_file = await file.text();
+    const sshUser = ($("scan-ssh-user") && $("scan-ssh-user").value.trim()) || "";
+    const sshPass = ($("scan-ssh-pass") && $("scan-ssh-pass").value) || "";
+    if (sshUser || sshPass) body.ssh = { user: sshUser, password: sshPass };
+    await execScan({
+      target,
+      community: body.community,
+      consent: body.consent,
+      extra: { config_file: body.config_file, ssh: body.ssh },
+      btn: $("scan-btn"),
+      btnLabel: "Run",
+      note: $("scan-note"),
+    });
+  });
+}
+
+function wireMiniScan() {
+  const mt = $("mini-target");
+  if (!mt) return;
+  mt.addEventListener("focus", refreshGatewaySuggestions);
+  const go = () => execScan({
+    target: mt.value.trim(),
+    community: "public",
+    consent: !!($("mini-consent") && $("mini-consent").checked),
+    btn: $("mini-run"),
+    btnLabel: "Scan",
+    note: $("mini-note"),
+  });
+  const run = $("mini-run");
+  if (run) run.addEventListener("click", go);
+  mt.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); go(); }
   });
 }
 
@@ -878,7 +997,13 @@ async function applyProtect() {
         if (i.ip) deviceByZone[i.ip.replace(/\/.*/, "")] = d.name;
       });
     });
-    renderAll();
+    // Deliberately do NOT re-render the discovered-systems list here: rebuilding
+    // the whole list on every protect click made the checkboxes/details flash.
+    // Only the panels that depend on the selection change.
+    renderRequirements(model().requirements, null);
+    fillPolicySelects();
+    fillAddressLists();
+    applyChangeTypeFilter();
     toast(prev.length
       ? `Protecting ${prev.length} discovered service${prev.length > 1 ? "s" : ""} — policy requirements updated below.`
       : "Nothing protected — those services stay open (no requirements). Tick a service to protect it.");
@@ -886,14 +1011,44 @@ async function applyProtect() {
     toast("Protect update failed: " + e.message, true);
   } finally {
     protectBusy = false;
+    if ([...protectSel].join(",") !== prev.join(",")) applyProtect();
   }
 }
+function svcDetailId(k) { return "svc-detail-" + k.replace(/[^a-zA-Z0-9.]/g, "-"); }
+
+function showServiceInlineDetail(chk, ip, port, svc) {
+  const item = chk.closest(".dev-item");
+  const label = chk.closest(".srv-tick");
+  if (!label) return;
+  removeServiceInlineDetail(chk);
+  const mac = (item && item.querySelector(".dev-meta")) ? item.querySelector(".dev-meta").textContent.trim() : "";
+  const desc = SERVICE_INFO[(svc || "").toLowerCase()] || (`TCP/UDP service listening on port ${port}`);
+  label.insertAdjacentHTML("afterend",
+    `<div class="svc-detail" id="${svcDetailId(ip + ":" + port)}">
+      <div class="svc-detail-head"><b>${esc(svc || port)}</b> · port <span class="mono">${esc(port)}</span> <span class="prot-badge">protected</span></div>
+      <div class="svc-detail-body">${esc(desc)}</div>
+      <div class="svc-detail-body">Host ${esc(ip)}${mac ? " · " + esc(mac) : ""} — added as a policy requirement.</div>
+    </div>`);
+}
+
+function removeServiceInlineDetail(chk) {
+  const item = chk.closest(".dev-item");
+  if (!item) return;
+  const ip = item.dataset.ip || "";
+  item.querySelectorAll(`.svc-detail`).forEach((el) => {
+    if (el.id === svcDetailId(ip + ":" + (chk.dataset.srv.split(":")[1] || ""))) el.remove();
+  });
+}
+
 function renderDevices(devices) {
   const protect = MODE === "scan";
   $("dev-count").textContent = devices.length + " systems";
+  const full = !!(document.getElementById("dev-full-detail") && document.getElementById("dev-full-detail").checked);
   const tint = { router: "rgba(107,155,212,0.15)", switch: "rgba(217,165,92,0.15)", host: "rgba(76,183,130,0.15)", server: "rgba(150,164,180,0.15)", printer: "rgba(185,140,224,0.15)", laptop: "rgba(94,200,178,0.15)", mobile: "rgba(240,160,112,0.15)", phone: "rgba(240,160,112,0.15)", camera: "rgba(224,112,144,0.15)" };
   const list = devices.filter((d) => devFilter === "all" || d.type_guess === devFilter || (devFilter === "host" && ["host", "server"].includes(d.type_guess)) || (devFilter === "router" && d.is_target));
-  $("dev-list").innerHTML = list.map((d) => {
+  const listEl = $("dev-list");
+  const scrollTop = listEl ? listEl.scrollTop : 0;
+  listEl.innerHTML = list.map((d) => {
     const cls = d.is_target ? "target" : "";
     const svcs = (d.services || []).map((s) => {
       const key = d.ip + ":" + s.port;
@@ -903,26 +1058,87 @@ function renderDevices(devices) {
     }).join("");
     const snmp = d.snmp && d.snmp.sysDescr ? `<div class="dev-snmp">SNMP · ${esc(d.snmp.sysName || "")} ${esc(d.snmp.sysDescr).slice(0, 100)}</div>` : "";
     const mac = d.mac ? `${d.mac}` : "no MAC in ARP";
+    const sys = d.snmp && d.snmp.sysDescr ? `${esc(d.snmp.sysDescr).slice(0, 140)}` : "";
+    const sysName = d.snmp && d.snmp.sysName ? `<div class="dk-row"><span>sysName</span><b>${esc(d.snmp.sysName)}</b></div>` : "";
+    const host = full ? kv("hostname", d.hostname, true) : "";
+    const os = full && sys ? `<div class="dk-row"><span>OS / system</span><b>${sys}</b></div>` : "";
+    const known = (d.hostname || (d.snmp && d.snmp.sysName)) ? "" : " · Unknown";
+    const fullBlock = full
+      ? `<div class="dev-full">
+           ${host}${os}${sysName}
+           <div class="dk-sec">open services</div><div class="dk-chips">${svcs || '<span class="muted" style="font-size:12px">none detected</span>'}</div>
+         </div>`
+      : (svcs ? `<div class="dev-srvs">${svcs}</div>` : "");
     return `<div class="dev-item clickable ${cls}" data-ip="${esc(d.ip)}">
       <div class="dev-icon" style="background:${tint[d.type_guess] || "none"}">${d.is_target ? `<span class="pulse-dot" title="target"></span>` : deviceIcon(d.type_guess, 26)}</div>
       <div class="dev-body">
         <div class="dev-head"><span class="dev-name">${esc(d.hostname || d.ip)}</span><span class="dev-tag ${d.type_guess}">${d.is_target ? "target " : ""}${d.type_guess}</span></div>
-        <div class="dev-meta">${d.ip} <span class="loc">· ${mac} · ${esc(d.vendor)}</span></div>
-        ${svcs ? `<div class="dev-srvs">${svcs}</div>` : ""}
-        ${snmp}
+        <div class="dev-meta">${d.ip} <span class="loc">· ${mac} · ${esc(d.vendor)}${(!full && !(d.hostname || (d.snmp && d.snmp.sysName))) ? known : ""}</span></div>
+        ${fullBlock}
+        ${!full ? snmp : ""}
       </div>
     </div>`;
   }).join("") || `<div class="muted" style="font-size:12px;padding:8px">no systems in this view</div>`;
+  if (listEl) listEl.scrollTop = scrollTop;
   if (protect) {
     $("dev-list").querySelectorAll("input[data-srv]").forEach((chk) => {
+      chk.addEventListener("click", (e) => e.stopPropagation());
       chk.addEventListener("change", () => {
         const k = chk.dataset.srv;
+        const item = chk.closest(".dev-item");
+        const ip = (item && item.dataset.ip) || k.split(":")[0];
+        const port = k.split(":")[1];
+        const svcTxt = chk.closest(".srv-tick") ? chk.closest(".srv-tick").textContent.trim() : "";
+        const svc = svcTxt.split("/")[1] || "";
         if (chk.checked) protectSel.add(k); else protectSel.delete(k);
+        if (chk.checked) {
+          highlightSvcKey = k;
+          showServiceInlineDetail(chk, ip, port, svc);
+        } else {
+          highlightSvcKey = "";
+          removeServiceInlineDetail(chk);
+        }
         applyProtect();
       });
     });
   }
   $("dev-list").querySelectorAll(".dev-item").forEach((el) => el.addEventListener("click", () => openDeviceByIp(el.dataset.ip)));
+  const tgl = document.getElementById("dev-full-detail");
+  if (tgl && !tgl.dataset.wired) {
+    tgl.dataset.wired = "1";
+    tgl.addEventListener("change", () => {
+      if (MODE === "scan" && SCAN) renderDevices(SCAN.devices);
+      else if (MODE === "agent" && AGENT_NET && AGENT_NET.source === "agent") renderDevices(AGENT_NET.scan_devices || (model().devices || []));
+    });
+  }
+}
+
+/* compact device strip on the Overview page */
+function renderOverviewStrip() {
+  const wrap = $("ov-strip"), cnt = $("ov-dev-count");
+  if (!wrap) return;
+  const m = model();
+  const devs = (m.devices || []);
+  const shown = devs.slice(0, 80);
+  if (cnt) {
+    const total = (MODE === "scan" && SCAN) ? (SCAN.devices || []).length : devs.length;
+    cnt.textContent = total + " device(s)";
+  }
+  if (!shown.length) {
+    wrap.innerHTML = `<div class="ov-empty">No devices loaded yet — run a scan above, or switch to Demo.</div>`;
+    return;
+  }
+  wrap.innerHTML = shown.map((d) => {
+    const ip = mainIp(d);
+    const raw = (MODE === "scan" && SCAN) ? (scanByIp[ip] || null) : null;
+    const tag = raw ? raw.type_guess : (d.type || "host");
+    return `<button type="button" class="ov-chip" data-ip="${esc(ip)}">
+      <span class="ov-ic">${deviceIcon(tag, 24)}</span>
+      <span class="ov-ip"><b>${esc(ip || "?")}</b></span>
+      <span class="ov-tag">${esc(tag)}</span>
+    </button>`;
+  }).join("");
+  wrap.querySelectorAll(".ov-chip").forEach((el) => el.addEventListener("click", () => openDeviceByIp(el.dataset.ip)));
 }
 
 function wireDevFilters() {
@@ -1594,6 +1810,7 @@ function refreshHint() {
   document.querySelectorAll("#mode-switch button").forEach((b) =>
     b.addEventListener("click", () => setMode(b.dataset.mode)));
   wireAgent();
+  wireAgentKey();
   wireDevFilters();
   document.addEventListener("keydown", (e) => {
     if (e.target && $("intent") === e.target && e.key === "Enter") {
@@ -1738,6 +1955,40 @@ function wireAgent() {
   if (sel) sel.addEventListener("change", () => { saveActiveOrg(sel.value); selectActiveOrg().then(() => { renderAll(); refreshSuggestions(); }); });
   if (btn) btn.addEventListener("click", () => { const c = $("agent-create"); if (c) c.hidden = !c.hidden; });
   if (go) go.addEventListener("click", createOrg);
+}
+
+function wireAgentKey() {
+  const inp = $("agent-key"), btn = $("agent-key-go");
+  if (!inp || !btn) return;
+  const load = async () => {
+    const key = (inp.value || "").trim();
+    if (!key) { toast("Paste the account's API key first.", true); return; }
+    btn.disabled = true; btn.textContent = "…";
+    try {
+      const res = await fetch("/api/org/network", { headers: { "X-NetProof-Key": key } });
+      if (res.status === 401) { toast("That API key was rejected.", true); return; }
+      if (!res.ok) throw new Error((await res.json()).detail || "load failed");
+      AGENT_NET = await res.json();
+      deviceByZone = {};
+      scanByIp = {};
+      (AGENT_NET.scan_devices || []).forEach((d) => { scanByIp[d.ip] = d; });
+      (AGENT_NET.devices || []).forEach((d) => {
+        d.interfaces && d.interfaces.forEach((i) => {
+          if (i.ip) deviceByZone[i.ip.replace(/\/.*/, "")] = d.name;
+        });
+      });
+      if (AGENT_NET.org || AGENT_NET.org_id) saveActiveOrg(AGENT_NET.org || AGENT_NET.org_id);
+      renderAgentPanel();
+      renderAll();
+      const n = (AGENT_NET.scan_devices || []).length;
+      toast(AGENT_NET.source === "agent"
+        ? `Key accepted — ${AGENT_NET.org_name || AGENT_NET.org}: ${n} device(s) rendered.`
+        : `Key accepted — no agent report yet for this account.`);
+    } catch (e) { toast("Load failed: " + e.message, true); }
+    btn.disabled = false; btn.textContent = "Load network";
+  };
+  btn.addEventListener("click", load);
+  inp.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); load(); } });
 }
 
 function updateVisibility() {
