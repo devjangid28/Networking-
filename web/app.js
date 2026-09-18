@@ -112,6 +112,9 @@ let AUTHED = false;    // dashboard session (isset /api/session)
 let recent = [];
 let report = null;
 let nodeCoords = {};   // device name -> {x,y}
+let nodePos = {};      // user-dragged device positions (persist across re-renders)
+let topoCtx = null;    // live topo context: { byName, links } for drag re-draws
+let _suppressClick = false; // true for one click right after a device drag
 let deviceByZone = {}; // zone name -> device name
 let scanByIp = {};     // raw scan device lookup by ip
 let highlightSvcKey = ""; // last service checkbox tapped, "ip:port"
@@ -590,6 +593,14 @@ function nodeDisplayName(dev) {
   return dev.name;
 }
 
+function posOf(d) {
+  const p = nodePos[d.name];
+  return p ? { x: p.x, y: p.y } : { x: d.x, y: d.y };
+}
+function linkDegree(d, links) {
+  return links.filter((l) => l.a_dev === d.name || l.b_dev === d.name).length;
+}
+
 function renderTopo() {
   stopTopoFlowOverlay();
   const svg = $("topo");
@@ -598,7 +609,8 @@ function renderTopo() {
   hideDeviceDetail();
 
   const m = model();
-  const devs = m.devices || [], links = m.links || [];
+  const devs = (m.devices || []).slice();
+  const links = m.links || [];
   const cnt = $("topo-count");
   if (cnt) cnt.textContent = (MODE === "scan" || MODE === "agent") ? devs.length + " device(s) on segment" : devs.length + " systems";
 
@@ -607,25 +619,35 @@ function renderTopo() {
     return;
   }
 
-  const byName = {};
-  devs.forEach((d) => (byName[d.name] = d));
+  /* ---- internet cloud glued NEXT TO the main/router device (every map) ---- */
+  const cloudDev = devs.find((d) => d.type === "cloud" || d.type === "internet");
+  const main = devs.find((d) => d.type === "router")
+    || devs.slice().sort((a, b) => linkDegree(b, links) - linkDegree(a, links))[0];
+  const mainPos = posOf(main);
 
-  let out = "";
-  links.forEach((l) => {
-    const a = byName[l.a_dev], b = byName[l.b_dev];
-    if (!a || !b) return;
-    out += `<line class="link-line" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="#2a3542" stroke-width="2" stroke-dasharray="5 6"/>`;
-    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
-    const iface = a.interfaces.find((i) => i.connected_to && i.connected_to.split(" ")[0] === b.name);
-    if (iface && iface.network) {
-      out += `<text class="link-net" x="${mx}" y="${my}" text-anchor="middle" dominant-baseline="middle">${esc(iface.network.replace(/\/24$/, "").replace(/\/32$/, "/32"))}</text>`;
+  const drawDevs = devs.slice();
+  const drawLinksList = links.slice();
+  let cloudName = cloudDev ? cloudDev.name : null;
+  if (!cloudDev) {
+    drawDevs.push({ name: "Internet", type: "cloud", interfaces: [] });
+    cloudName = "Internet";
+    if (main.name !== cloudName && !drawLinksList.some((l) => (l.a_dev === main.name && l.b_dev === cloudName) || (l.a_dev === cloudName && l.b_dev === main.name))) {
+      drawLinksList.push({ a_dev: cloudName, b_dev: main.name });
     }
-  });
+  }
+  const cloudPos = nodePos[cloudName]
+    || { x: mainPos.x + (mainPos.x + 170 <= 2400 ? 170 : -170), y: mainPos.y - 45 };
+  nodeCoords[cloudName] = cloudPos;
 
-  devs.forEach((d) => {
-    nodeCoords[d.name] = { x: d.x, y: d.y };
+  const byName = {};
+  drawDevs.forEach((d) => { byName[d.name] = d; nodeCoords[d.name] = posOf(d); });
+  topoCtx = { byName, links: drawLinksList };
+
+  let out = linkMarkup(byName, drawLinksList);
+  drawDevs.forEach((d) => {
+    const c = nodeCoords[d.name];
     const isCloud = d.type === "cloud" || d.type === "internet";
-    out += `<g class="node" data-device="${esc(d.name)}" transform="translate(${d.x},${d.y})">`;
+    out += `<g class="node" data-device="${esc(d.name)}" transform="translate(${c.x},${c.y})">`;
     out += `<rect class="sel-ring" x="-44" y="-30" width="88" height="70" rx="16"/>`;
     out += `<g transform="translate(-36,-26)">${deviceIcon(d.type, 72)}</g>`;
     if (isCloud) {
@@ -641,7 +663,7 @@ function renderTopo() {
   svg.innerHTML = out;
   // Auto-size the SVG viewBox to fit all nodes with padding
   const PAD = 80;
-  const xs = devs.map((d) => d.x), ys = devs.map((d) => d.y);
+  const xs = drawDevs.map((d) => nodeCoords[d.name].x), ys = drawDevs.map((d) => nodeCoords[d.name].y);
   const minX = Math.min(...xs) - PAD, minY = Math.min(...ys) - PAD;
   const maxX = Math.max(...xs) + PAD, maxY = Math.max(...ys) + PAD;
   const vw = maxX - minX, vh = maxY - minY;
@@ -652,13 +674,58 @@ function renderTopo() {
   wireTopoClicks(svg);
 }
 
+/* Re-draws only the link lines + their IP labels, using live nodeCoords
+   (called while dragging a device so cables follow it in real time). */
+function drawLinks(svg) {
+  if (!topoCtx) return;
+  svg.querySelectorAll(".link-line, .link-net-bg, .link-net").forEach((e) => e.remove());
+  svg.insertAdjacentHTML("afterbegin", linkMarkup(topoCtx.byName, topoCtx.links));
+}
+
+/* SVG markup for every link: a dashed cable + a readable IP-address pill. */
+function linkMarkup(byName, links) {
+  const drawn = new Set();
+  let out = "";
+  links.forEach((l) => {
+    const a = byName[l.a_dev], b = byName[l.b_dev];
+    if (!a || !b) return;
+    const ka = [l.a_dev, l.b_dev].sort().join("|");
+    if (drawn.has(ka)) return;
+    drawn.add(ka);
+    const c1 = nodeCoords[l.a_dev], c2 = nodeCoords[l.b_dev];
+    if (!c1 || !c2) return;
+    out += `<line class="link-line" x1="${c1.x}" y1="${c1.y}" x2="${c2.x}" y2="${c2.y}"/>`;
+    const mx = (c1.x + c2.x) / 2, my = (c1.y + c2.y) / 2;
+    const aIf = (a.interfaces || []).find((i) => i.connected_to && i.connected_to.split(" ")[0] === b.name);
+    const bIf = (b.interfaces || []).find((i) => i.connected_to && i.connected_to.split(" ")[0] === a.name);
+    const aIP = aIf && aIf.ip ? aIf.ip.replace(/\/.*/, "") : "";
+    const bIP = bIf && bIf.ip ? bIf.ip.replace(/\/.*/, "") : "";
+    let label = "";
+    if (aIP && bIP) label = `${aIP} ⇄ ${bIP}`;
+    else if (aIP) label = aIP;
+    else if (aIf && aIf.network) label = aIf.network.replace(/\/24$/, "");
+    if (label) {
+      const w = label.length * 6.4 + 18;
+      out += `<rect class="link-net-bg" x="${mx - w / 2}" y="${my - 9}" width="${w}" height="18" rx="9"/>`;
+      out += `<text class="link-net" x="${mx}" y="${my}" text-anchor="middle" dominant-baseline="middle">${esc(label)}</text>`;
+    }
+  });
+  return out;
+}
+
 function svgStyle() {
   const s = document.createElementNS("http://www.w3.org/2000/svg", "style");
   s.textContent = `
-    .node-name { fill:#e3e9f1; font:600 12.5px Inter, sans-serif; }
-    .node-ip { fill:#96a4b4; font:500 9.5px "JetBrains Mono", monospace; }
-    .link-net { fill:#66758a; font:500 9.5px "JetBrains Mono", monospace; }
-    .node { cursor:pointer; }
+    .link-line { stroke:#3a4a58; stroke-width:2; stroke-dasharray:5 6; }
+    .node-name { fill:#eef3f8; font:700 12.5px Inter, sans-serif;
+      stroke:#0b0f14; stroke-width:3px; paint-order:stroke; }
+    .node-ip { fill:#c6d2e2; font:600 10.5px "JetBrains Mono", monospace;
+      stroke:#0b0f14; stroke-width:3px; paint-order:stroke; }
+    .link-net-bg { fill:#0e1418; stroke:rgba(148,184,210,0.28); stroke-width:1; }
+    .link-net { fill:#cfe0ef; font:600 10px "JetBrains Mono", monospace;
+      paint-order:stroke; }
+    .node { cursor:grab; }
+    .node:active { cursor:grabbing; }
     .node .sel-ring { fill:rgba(94,200,178,0.05); stroke:transparent; stroke-width:1.6; }
     .node:hover .sel-ring { stroke:rgba(94,200,178,0.45); }
     .node.selected .sel-ring { stroke:#5ec8b2; }
@@ -802,9 +869,48 @@ function openDeviceByIp(ip) {
 }
 
 function wireTopoClicks(svg) {
-  svg.querySelectorAll("g.node").forEach((g) => {
+  const nodes = svg.querySelectorAll("g.node");
+  let drag = null;
+  nodes.forEach((g) => {
+    g.addEventListener("pointerdown", (ev) => {
+      if (ev.button !== 0) return;
+      _suppressClick = false;
+      const name = g.dataset.device;
+      const mt = g.getAttribute("transform").match(/translate\(([-\d.]+),([-\d.]+)\)/);
+      if (!mt) return;
+      const ctm = svg.getScreenCTM();
+      const pt = svg.createSVGPoint(); pt.x = ev.clientX; pt.y = ev.clientY;
+      const sp = ctm ? pt.matrixTransform(ctm.inverse()) : null;
+      if (!sp) return;
+      drag = { name, startX: +mt[1], startY: +mt[2], sp, moved: false };
+      try { g.setPointerCapture(ev.pointerId); } catch (e) {}
+      ev.preventDefault();
+    });
+    g.addEventListener("pointermove", (ev) => {
+      if (!drag || drag.name !== g.dataset.device) return;
+      const ctm = svg.getScreenCTM();
+      if (!ctm) return;
+      const pt = svg.createSVGPoint(); pt.x = ev.clientX; pt.y = ev.clientY;
+      const sp = pt.matrixTransform(ctm.inverse());
+      const nx = Math.round(drag.startX + (sp.x - drag.sp.x));
+      const ny = Math.round(drag.startY + (sp.y - drag.sp.y));
+      nodeCoords[drag.name] = { x: nx, y: ny };
+      g.setAttribute("transform", `translate(${nx},${ny})`);
+      drag.moved = true;
+      drawLinks(svg);
+      ev.preventDefault();
+    });
+    g.addEventListener("pointerup", (ev) => {
+      if (!drag || drag.name !== g.dataset.device) return;
+      if (drag.moved) {
+        nodePos[drag.name] = { x: nodeCoords[drag.name].x, y: nodeCoords[drag.name].y };
+        _suppressClick = true;
+      }
+      drag = null;
+    });
     g.addEventListener("click", (ev) => {
       ev.stopPropagation();
+      if (_suppressClick) { _suppressClick = false; return; }
       svg.querySelectorAll("g.node.selected").forEach((x) => x.classList.remove("selected"));
       g.classList.add("selected");
       showDeviceDetail(g.dataset.device);
@@ -3367,17 +3473,28 @@ function _animateFlowPacket(svg, flow, speed) {
   });
 }
 
-/* Main loop: cycle through all flows continuously */
+/* Main loop: in parallel-blast mode every flow animates at once (a red
+   explosion to all devices); otherwise cycle the flows one by one. */
 async function _topoFlowLoop(state) {
   const svg = $("topo");
   if (!svg) return;
+  const lbl = $("topo-flow-label");
   while (_topoFlowState === state && !state.stopped) {
     if (state.paused) { await delay(80); continue; }
+
+    if (state.parallel) {
+      if (lbl) {
+        lbl.textContent = `${state.flows.length} refused paths · deny → every device ✗`;
+        lbl.style.color = "var(--danger)";
+      }
+      await Promise.all(state.blast.map((f) => _animateFlowPacket(svg, f, state.speed)));
+      await delay(Math.max(120, 500 / state.speed));
+      continue;
+    }
+
     const flow = state.flows[state.idx % state.flows.length];
     state.idx++;
     if (!flow) { await delay(100); continue; }
-    // update the overlay bar label
-    const lbl = $("topo-flow-label");
     if (lbl) {
       const parts = flow.key.split(" ~ ");
       lbl.textContent = (parts[0] || "").split("@").pop() + " → " + (parts[1] || "").split("@").pop()
@@ -3398,11 +3515,19 @@ function startTopoFlowOverlay(report) {
 
   const which = "after";
   const flows = _buildTopoFlows(report, which);
+  const blast = which === "after" ? denyBlastFlows(report) : [];
+  blast.forEach((b) => {
+    if (!flows.some((f) => f.path.join("|") === b.path.join("|"))) flows.push(b);
+  });
   if (!flows.length) return;
+
+  // A deny blast sends a RED ball toward EVERY device at the same time so the
+  // whole network visibly refuses; matrix path lines stay as static context.
+  const parallel = blast.length > 0;
 
   _drawPathLines(svg, flows);
 
-  const state = { flows, idx: 0, paused: false, speed: 1, which, stopped: false, report };
+  const state = { flows, blast, idx: 0, paused: false, speed: 1, which, stopped: false, report, parallel };
   _topoFlowState = state;
 
   // inject the overlay control bar if not present
@@ -3410,6 +3535,51 @@ function startTopoFlowOverlay(report) {
 
   _topoFlowLoop(state);
 }
+
+/* BFS the whole network from the device enforcing a DENY change and produce
+   one red (unreachable) flow toward every other system, so the replay shows
+   "the server refuses everyone". */
+function denyBlastFlows(report) {
+  if (!report || !report.change) return [];
+  const ch = report.change;
+  if (!/_filter_rule/.test(ch.type) || !ch.rule || ch.rule.action !== "deny") return [];
+  const m = model();
+  const devs = m.devices || [], links = m.links || [];
+  if (!devs.length) return [];
+
+  let enforcer = null;
+  if (ch.filter) {
+    enforcer = devs.find((d2) => (d2.interfaces || []).some((i) => (i.filters || []).includes(ch.filter)))
+      || devs.find((d2) => d2.name === ch.filter) || null;
+  }
+  if (!enforcer) enforcer = devs.find((d2) => d2.type === "router");
+  if (!enforcer) enforcer = devices_key0(devs);
+  if (!enforcer) return [];
+
+  const adj = {};
+  devs.forEach((d) => (adj[d.name] = []));
+  links.forEach((l) => {
+    adj[l.a_dev] = adj[l.a_dev] || []; adj[l.b_dev] = adj[l.b_dev] || [];
+    adj[l.a_dev].push(l.b_dev); adj[l.b_dev].push(l.a_dev);
+  });
+
+  const flows = [];
+  const seen = new Set([enforcer.name]);
+  const queue = [[enforcer.name, [enforcer.name]]];
+  while (queue.length) {
+    const [cur, path] = queue.shift();
+    (adj[cur] || []).forEach((nxt) => {
+      if (seen.has(nxt)) return;
+      seen.add(nxt);
+      const np = path.concat(nxt);
+      flows.push({ key: `${enforcer.name} ~ ${nxt}`, path: np, reachable: false, drop: {}, status: "denied" });
+      queue.push([nxt, np]);
+    });
+  }
+  return flows;
+}
+
+function devices_key0(devs) { return devs[0]; }
 
 function stopTopoFlowOverlay() {
   if (_topoFlowState) { _topoFlowState.stopped = true; _topoFlowState = null; }
@@ -3459,13 +3629,22 @@ function _ensureOverlayBar(report) {
   $("ob-after").addEventListener("click", () => {
     if (!_topoFlowState) return;
     $("ob-after").classList.add("active"); $("ob-before").classList.remove("active");
-    _topoFlowState.flows = _buildTopoFlows(_topoFlowState.report, "after");
+    const blast = denyBlastFlows(_topoFlowState.report);
+    let flows = _buildTopoFlows(_topoFlowState.report, "after");
+    blast.forEach((b) => {
+      if (!flows.some((f) => f.path.join("|") === b.path.join("|"))) flows.push(b);
+    });
+    _topoFlowState.flows = flows;
+    _topoFlowState.blast = blast;
+    _topoFlowState.parallel = blast.length > 0;
     _topoFlowState.idx = 0;
     _drawPathLines($("topo"), _topoFlowState.flows);
   });
   $("ob-before").addEventListener("click", () => {
     if (!_topoFlowState) return;
     $("ob-before").classList.add("active"); $("ob-after").classList.remove("active");
+    _topoFlowState.blast = [];
+    _topoFlowState.parallel = false;
     _topoFlowState.flows = _buildTopoFlows(_topoFlowState.report, "before");
     _topoFlowState.idx = 0;
     _drawPathLines($("topo"), _topoFlowState.flows);
