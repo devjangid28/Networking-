@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS verdicts (
     model_hash          TEXT NOT NULL,
     engine_version      TEXT NOT NULL,
     requester           TEXT,
+    org_id              TEXT,
     raw_change          TEXT NOT NULL,
     ir_change           TEXT NOT NULL,
     change_fingerprint  TEXT,
@@ -42,7 +43,8 @@ CREATE TABLE IF NOT EXISTS verdicts (
     trust_score         INTEGER,
     guardrails          TEXT,
     trace               TEXT,
-    report              TEXT NOT NULL
+    report              TEXT NOT NULL,
+    model_snapshot      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_verdicts_created ON verdicts (created_at);
 """
@@ -99,7 +101,7 @@ def canonical_snapshot(net: Net) -> str:
         "description": net.description,
         "devices": devices,
         "filters": sorted(
-            [{"name": f.name, "default": f.default,
+            [{"name": f.name, "default": f.default, "stateful": f.stateful,
               "rules": [{"action": r.action, "src": r.src, "dst": r.dst, "proto": r.proto, "dport": r.dport, "source": r.source} for r in f.rules]} for f in net.filters.values()],
             key=lambda f: f["name"],
         ),
@@ -136,6 +138,12 @@ def _conn(db: str = DEFAULT_DB) -> sqlite3.Connection:
             conn = sqlite3.connect(db, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             conn.executescript(_SCHEMA)
+            # migrate pre-snapshot databases (CREATE TABLE IF NOT EXISTS won't add the column)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(verdicts)")}
+            if "model_snapshot" not in cols:
+                conn.execute("ALTER TABLE verdicts ADD COLUMN model_snapshot TEXT")
+            if "org_id" not in cols:
+                conn.execute("ALTER TABLE verdicts ADD COLUMN org_id TEXT")
             conn.commit()
             _conns[db] = conn
         return conn
@@ -148,19 +156,21 @@ def save_verdict(
     model_source: dict | None = None,
     requester: str | None = None,
     guardrails: list[dict] | None = None,
+    org_id: str | None = None,
     db: str = DEFAULT_DB,
 ) -> str:
     vid = uuid.uuid4().hex[:16]
     summary = report.get("summary") or {}
+    import datetime
+    snapshot_json = canonical_snapshot(net)
     with _lock:
         conn = _conn(db)
-        import datetime
         conn.execute(
             """INSERT INTO verdicts
-               (id, created_at, model_name, model_source, model_hash, engine_version, requester,
+               (id, created_at, model_name, model_source, model_hash, engine_version, requester, org_id,
                 raw_change, ir_change, change_fingerprint, verdict_final, trust_score,
-                guardrails, trace, report)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                guardrails, trace, report, model_snapshot)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 vid,
                 datetime.datetime.now().isoformat(timespec="seconds"),
@@ -169,6 +179,7 @@ def save_verdict(
                 model_hash(net),
                 report.get("engine_version", ""),
                 requester,
+                org_id,
                 json.dumps(raw_change, default=str),
                 json.dumps(report.get("change") or raw_change, default=str),
                 change_fingerprint(raw_change),
@@ -177,6 +188,7 @@ def save_verdict(
                 json.dumps(guardrails or []),
                 json.dumps(report.get("findings", []), default=str),
                 json.dumps(report, default=str),
+                snapshot_json,
             ),
         )
         conn.commit()
@@ -191,18 +203,43 @@ def get_verdict(vid: str, db: str = DEFAULT_DB) -> Optional[dict]:
     return _row_to_dict(row)
 
 
-def list_verdicts(limit: int = 20, db: str = DEFAULT_DB) -> list[dict]:
+def get_snapshot(vid: str, db: str = DEFAULT_DB) -> Optional[Net]:
+    """Return a reconstructed ``Net`` from the persisted model_snapshot for
+    verdict *vid*. Returns None when the snapshot is missing (old verdicts
+    predating the snapshot column)."""
     with _lock:
-        rows = _conn(db).execute(
-            "SELECT id, created_at, model_name, engine_version, requester, change_fingerprint, "
-            "verdict_final, trust_score FROM verdicts ORDER BY created_at DESC LIMIT ?",
-            (int(limit),),
-        ).fetchall()
+        row = _conn(db).execute("SELECT model_snapshot FROM verdicts WHERE id = ?", (vid,)).fetchone()
+    if row is None:
+        return None
+    snap = row["model_snapshot"]
+    if not snap:
+        return None
+    try:
+        return Net.from_dict(json.loads(snap))
+    except Exception:
+        return None
+
+
+def list_verdicts(limit: int = 20, db: str = DEFAULT_DB, org_id: str | None = None) -> list[dict]:
+    with _lock:
+        if org_id:
+            rows = _conn(db).execute(
+                "SELECT id, created_at, model_name, engine_version, requester, org_id, change_fingerprint, "
+                "verdict_final, trust_score FROM verdicts WHERE org_id = ? ORDER BY created_at DESC LIMIT ?",
+                (org_id, int(limit)),
+            ).fetchall()
+        else:
+            rows = _conn(db).execute(
+                "SELECT id, created_at, model_name, engine_version, requester, org_id, change_fingerprint, "
+                "verdict_final, trust_score FROM verdicts ORDER BY created_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
     return [_row_to_dict(r) for r in rows]
 
 
 def _row_to_dict(row) -> dict:
     d = dict(row)
+    d.pop("model_snapshot", None)
     for k in ("model_source", "raw_change", "ir_change", "guardrails", "trace", "report"):
         if d.get(k):
             try:

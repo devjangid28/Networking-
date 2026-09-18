@@ -1,0 +1,61 @@
+# NetProof deployment (server container + persistent SQLite volume).
+#
+# Dev mode (HTTP on 127.0.0.1:8000):
+#   docker compose up -d
+#   open http://127.0.0.1:8000
+#
+# Production mode (Caddy reverse proxy, TLS via Let's Encrypt):
+#   set NETPROOF_DOMAIN=netproof.example.org in .env, then:
+#   docker compose --profile production up -d
+#   open https://netproof.example.org
+#
+# Environment: copy `.env.example` to `.env` and set NETPROOF_ADMIN_PASS before
+# the first `docker compose up` — the container refuses to start without it.
+services:
+  netproof:
+    build: .
+    image: netproof:0.3.0
+    container_name: netproof
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # REQUIRED — the admin password for the dashboard. Never use the default.
+      - NETPROOF_ADMIN_PASS=${NETPROOF_ADMIN_PASS:?set NETPROOF_ADMIN_PASS in .env}
+      - NETPROOF_ADMIN_USER=${NETPROOF_ADMIN_USER:-admin}
+      # SQLite lives behind this volume by default; override to start from scratch.
+      - NETPROOF_DB=${NETPROOF_DB:-/app/backend/data/netproof.db}
+      - NETPROOF_ORG_DIR=${NETPROOF_ORG_DIR:-/app/backend/data/orgs}
+      # Comma-separated; unset = same-origin only (recommended).
+      - NETPROOF_ALLOWED_ORIGINS=${NETPROOF_ALLOWED_ORIGINS:-}
+    volumes:
+      - netproof-data:/app/backend/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  # Production TLS reverse proxy — started only with "docker compose --profile production up"
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    profiles: ["production"]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - netproof
+    environment:
+      - NETPROOF_DOMAIN=${NETPROOF_DOMAIN:?set NETPROOF_DOMAIN in .env when using --profile production}
+
+volumes:
+  netproof-data:
+  caddy-data:
+  caddy-config:

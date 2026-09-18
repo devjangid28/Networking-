@@ -141,11 +141,6 @@ def _first_main_ip(net: Net, name: str) -> str:
     return ""
 
 
-def _is_routerish(net: Net, name: str) -> bool:
-    dev = net.devices.get(name)
-    return bool(dev and dev.dtype in ("router", "firewall"))
-
-
 def _resolve_addr(net: Net, token: str, aliases: dict[str, str]) -> str:
     """Turn a raw token (ip/cidr/device name/zone name) into an address string."""
     tok = (token or "").strip().rstrip(".,;")
@@ -295,7 +290,7 @@ def _parse_route(text: str, net: Net) -> dict:
     if onm:
         onm = onm[3:].strip()
         hit = aliases.get(onm.lower())
-        if hit and (_is_routerish(net, hit) or True):
+        if hit:
             dev = hit
 
     if removing:
@@ -319,8 +314,6 @@ def _add_route(text: str, net: Net, dev: str, aliases: dict[str, str]) -> dict:
             nh = None
     if not nh:
         return _err("no next hop found. e.g. 'add route 10.99.0.0/16 via 192.168.1.2 on firewall'")
-    if not network.endswith("/"):
-        pass
     change = {"type": "add_route", "device": dev, "route": {"network": network, "next_hop": nh}}
     return _ok(change, f"add route {network} via {nh} on {dev}", 1.0, {"destination": network, "device": dev, "next_hop": nh})
 

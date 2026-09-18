@@ -33,21 +33,59 @@ from engine.validate import ALL_PRESETS, ENGINE_VERSION  # noqa: E402
 from engine import validate as _validate  # noqa: E402
 
 
+def _model_dir() -> Path:
+    return Path(BACKEND / "data").resolve()
+
+
+def _inside_data(p: Path, data_dir: Path) -> bool:
+    try:
+        p.resolve().relative_to(data_dir)
+        return True
+    except ValueError:
+        return False
+
+
 def _model() -> Net:
-    return load_net(str(BACKEND / "data" / "acme_office.yaml"))
+    return load_net(str(_model_dir() / "acme_office.yaml"))
 
 
 def _net_for(args: dict) -> Net:
+    """Load a model but NEVER allow arbitrary filesystem reads.
+
+    ``model`` may be:
+      - a bare model name/stem found under backend/data (e.g. "acme_office")
+      - a relative path resolved from cwd (e.g. "data/acme_office.yaml")
+      - an absolute path that resolves inside backend/data
+    Anything outside that directory is rejected with a clear error.
+    """
     path = (args or {}).get("model") or ""
     if not path:
         return _model()
-    cand = Path(path)
-    if cand.exists():
-        return load_net(str(cand))
-    for f in (BACKEND / "data").glob("*.yaml"):
-        if f.stem == path or f.name == path:
-            return load_net(str(f))
-    return _model()
+    data_dir = _model_dir()
+
+    def _try(p: Path) -> Path | None:
+        """Return the path if it exists and is inside data_dir, else None.
+        Also appends '.yaml' for bare stems."""
+        r = p.resolve()
+        if not _inside_data(r, data_dir):
+            return None
+        if r.is_file():
+            return r
+        y = r.with_suffix(".yaml")
+        if not r.suffix and y.is_file():
+            return y
+        return None
+
+    target = _try(Path(path))          # works for absolute + cwd-relative
+    if target is None:
+        target = _try(data_dir / path)  # works for bare names
+    if target is not None:
+        return load_net(str(target))
+    raise ValueError(
+        f"model path '{path}' is not inside the allowed models directory "
+        f"({data_dir}). Pass a bare model name (e.g. 'acme_office') or a "
+        "path inside that directory."
+    )
 
 
 def _inventory(net: Net) -> dict:

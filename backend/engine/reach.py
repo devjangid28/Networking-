@@ -236,64 +236,112 @@ def _device_owning_ip(net: Net, addr: str) -> Device | None:
 # Reachability                                                            #
 # --------------------------------------------------------------------------- #
 
-def check_filters(filters: list[Filter], src_ip: int, dst_ip: int, proto: str, dport) -> tuple[bool, dict]:
+def _covering_net(net: Net, ip: int) -> str | None:
+    """Most specific interface subnet containing ``ip`` (canonical ``a.b.c.0/plen``).
+
+    Used to reason about return traffic at subnet granularity: the zone-level
+    matrix flows use a prefix's representative address, while connections are
+    tracked at host granularity. Collapsing both to their covering subnet lets
+    a permitted client->server connection clean the reverse server->client flow.
+    """
+    best = None
+    for dev in net.devices.values():
+        for i in dev.interfaces:
+            if i.prefix and i.prefix.plen > 0 and i.prefix.contains(ip) and (best is None or i.prefix.plen > best.plen):
+                best = i.prefix
+    if best is None:
+        return None
+    return f"{ip_str(best.lo)}/{best.plen}"
+
+
+def _established_return(net: Net, established: set, src_ip: int, dst_ip: int, proto: str) -> bool:
+    """Stateful-firewall semantics: is this packet the *return traffic* of an
+    already-permitted connection?
+
+    ``established`` holds ``(proto, src_net, dst_net)`` for every flow that was
+    actually permitted across a stateful filter edge (forward direction). A
+    packet is return traffic when its source/destination covering subnets are
+    the mirror image (src_net == conn.dst_net, dst_net == conn.src_net) of a
+    recorded connection. Explicit deny rules are evaluated BEFORE this and
+    still block; the auto-allow only covers the no-match case.
+    """
+    pkt_src_net = _covering_net(net, src_ip)
+    pkt_dst_net = _covering_net(net, dst_ip)
+    for eproto, esrc_net, edst_net in established:
+        if esrc_net != pkt_dst_net or edst_net != pkt_src_net:
+            continue
+        if eproto == proto or eproto == "any" or proto == "any":
+            return True
+    return False
+
+
+def check_filters(filters: list[Filter], src_ip: int, dst_ip: int, proto: str, dport, *, net: Net | None = None, established: set | None = None) -> tuple[bool, dict]:
     """Apply a chain of ACL/firewall filters to a flow.
 
-    Returns (allowed, detail). Conservative semantics:
+    Every filter in the chain is evaluated in order and the flow is only
+    permitted if EVERY filter permits it (a single deny anywhere blocks the
+    flow). Conservative semantics:
       - a rule matching a specific protocol/port does NOT apply to 'any'
         protocol flows (we cannot prove the match), so generic reachability is
         judged against generic rules + the default action.
+      - a Stateful filter additionally auto-allows the *return* traffic of a
+        previously permitted connection (``established``), mirroring a real
+        firewall's connection table. Explicit deny rules still win.
 
-    The detail dict includes a ``trace`` list of per-rule evaluations (for
-    line-by-line simulation on the frontend).
+    The detail dict includes a ``trace`` list with one entry per filter, each
+    holding its per-rule evaluations (for line-by-line simulation on the
+    frontend). Top-level ``filter``/``rule_index``/``rule``/``by_default``/
+    ``default`` describe the blocking filter (or the last filter when nothing
+    blocks).
     """
+    if not filters:
+        return True, {"no_filter": True, "trace": None}
+
+    traces: list[dict] = []
+    blocking: dict | None = None
+
     for filt in filters:
         checks = []
+        decision = None
+        hit_idx = None
         for idx, rule in enumerate(filt.rules):
             matched = _rule_matches(rule, src_ip, dst_ip, proto, dport)
-            entry = {
-                "index": idx,
-                "desc": rule.describe(),
-                "action": rule.action,
-                "matched": matched,
-            }
-            checks.append(entry)
+            checks.append({"index": idx, "desc": rule.describe(), "action": rule.action, "matched": matched})
             if matched:
-                allowed = rule.action == "permit"
-                return allowed, {
-                    "device": None,
-                    "filter": filt.name,
-                    "rule_index": idx,
-                    "rule": rule.describe(),
-                    "by_default": False,
-                    "trace": {
-                        "filter": filt.name,
-                        "default_action": filt.default,
-                        "checks": checks,
-                        "allowed": allowed,
-                        "by_default": False,
-                        "hit_rule": idx,
-                    },
-                }
-        allowed = filt.default == "permit"
-        checks.append({"index": None, "desc": None, "action": None, "matched": False})
-        return allowed, {
-            "device": None,
+                decision = rule.action
+                hit_idx = idx
+                break
+        by_default = decision is None
+        estab = False
+        if by_default and filt.stateful and net is not None and established and _established_return(net, established, src_ip, dst_ip, proto):
+            estab = True
+            allowed = True
+        else:
+            allowed = (decision == "permit") if not by_default else filt.default == "permit"
+        entry = {
             "filter": filt.name,
-            "rule": None,
-            "rule_index": None,
-            "by_default": True,
-            "default": filt.default,
-            "trace": {
-                "filter": filt.name,
-                "default_action": filt.default,
-                "checks": checks,
-                "allowed": allowed,
-                "by_default": True,
-                "hit_rule": None,
-            },
+            "default_action": filt.default,
+            "checks": checks,
+            "allowed": allowed,
+            "by_default": by_default,
+            "hit_rule": hit_idx,
+            "established": estab,
         }
-    return True, {"no_filter": True, "trace": None}
+        traces.append(entry)
+        if not allowed and blocking is None:
+            blocking = entry
+
+    ref = blocking if blocking is not None else traces[-1]
+    return not blocking, {
+        "device": None,
+        "filter": ref["filter"],
+        "rule_index": ref["hit_rule"],
+        "rule": next((c["desc"] for c in ref["checks"] if c["matched"]), None),
+        "by_default": ref["by_default"],
+        "default": ref["default_action"],
+        "state_allowed": any(t.get("established") for t in traces),
+        "trace": traces,
+    }
 
 
 def _rule_matches(rule, src_ip: int, dst_ip: int, proto: str, dport) -> bool:
@@ -332,8 +380,15 @@ def resolve_next_hop(net: Net, dev: Device, next_hop_ip: int):
     return None, None, None
 
 
-def resolve_flow(net: Net, src_rep: int, src_origin: str, dst_ip: int, proto: str, dport) -> dict:
+def resolve_flow(net: Net, src_rep: int, src_origin: str, dst_ip: int, proto: str, dport, established: set | None = None) -> dict:
     """Walk the data plane from the source device to the destination.
+
+    ``established`` is an optional cross-flow connection table (created by the
+    validator and shared across flows): pairs ``(proto, src_net, dst_net)`` for
+    every flow actually permitted across a stateful filter edge. When provided,
+    stateful filters auto-allow return traffic (see ``check_filters``) and new
+    permitted flows are recorded, so a later flow (e.g. the reverse direction in
+    the zone matrix) resolves against real connection state.
 
     Returns a verdict dict with path, drop evidence, NAT info, and a per-rule
     filter trace (for line-by-line simulation).
@@ -369,9 +424,11 @@ def resolve_flow(net: Net, src_rep: int, src_origin: str, dst_ip: int, proto: st
             iface = _interface(cur, arrived_iface)
             if iface is not None and iface.filters:
                 filters = [net.filters[f] for f in iface.filters if f in net.filters]
-                allowed, detail = check_filters(filters, src_ip, dst_ip, proto, dport)
-                if detail.get("trace"):
-                    trace_all.append({"device": cur.name, "iface": arrived_iface, **detail["trace"]})
+                allowed, detail = check_filters(filters, src_ip, dst_ip, proto, dport, net=net, established=established)
+                for tr in detail.get("trace") or []:
+                    trace_all.append({"device": cur.name, "iface": arrived_iface, **tr})
+                if allowed and established is not None and not detail.get("state_allowed") and any(f.stateful for f in filters):
+                    established.add((proto, _covering_net(net, src_ip), _covering_net(net, dst_ip)))
                 if not allowed:
                     steps.append({"device": cur.name, "iface": arrived_iface, "note": f"blocked by {detail.get('filter')}"})
                     return _verdict("blocked", path, drop={**detail, "device": cur.name, "iface": arrived_iface}, steps=steps, trace=trace_all)

@@ -1,10 +1,13 @@
 """Full backward-compatibility + new agent endpoint verification."""
-import json, sys
+import json, sys, os
+os.environ.setdefault("NETPROOF_ADMIN_USER", "admin")
+os.environ.setdefault("NETPROOF_ADMIN_PASS", "admin-test-pass-2026")
 from starlette.testclient import TestClient
 from main import app
 from engine.validate import ALL_PRESETS
 
 c = TestClient(app, raise_server_exceptions=False)
+c_anon = TestClient(app, raise_server_exceptions=False)
 ok = True
 
 def check(label, cond):
@@ -13,6 +16,23 @@ def check(label, cond):
     if not cond:
         ok = False
     print(f"  [{status}] {label}")
+
+print("=== Phase 0: dashboard session auth ===")
+
+r = c_anon.get("/api/orgs")
+check("orgs 401 without session", r.status_code == 401)
+
+r = c.post("/api/login", json={"username": "admin", "password": "admin-test-pass-2026"})
+check("login ok", r.status_code == 200 and r.json().get("ok"))
+
+r = c.post("/api/login", json={"username": "admin", "password": "wrong"})
+check("login wrong password 401", r.status_code == 401)
+
+r = c.get("/api/session")
+check("session authenticated", r.json().get("authenticated") is True)
+
+check("orgs 200 with session", c.get("/api/orgs").status_code == 200)
+print()
 
 print("=== Phase 1-5 backward compat ===")
 
@@ -82,7 +102,7 @@ r = c.get("/api/orgs")
 check("list orgs has >=2", len(r.json()["orgs"]) >= 2)
 
 # Post report no auth
-r = c.post("/api/agent/report", json={"scan": {"target":"1.2.3.4","network":"1.2.3.0/24","devices":[{"ip":"1.2.3.1","is_target":True,"type_guess":"router","hostname":"r","services":[]}],"notes":[]}})
+r = c.post("/api/agent/report", json={"scan": {"target":"1.2.3.4","network":"1.2.3.0/24","devices":[{"ip":"1.2.3.1","is_target":True,"type_guess":"router","hostname":"r","services":[]}],"notes":[]}, "consent": True})
 check("no-auth 401", r.status_code == 401)
 
 # Post report valid
@@ -103,7 +123,7 @@ config_payload = {
         "routes": [{"network": "0.0.0.0/0", "next_hop": "203.0.113.1"}],
     }
 }
-r = c.post("/api/agent/report", json={"scan": scan_payload, "config": config_payload, "agent_version": "0.1.0", "source_host": "laptop"}, headers={"X-NetProof-Key": org_key})
+r = c.post("/api/agent/report", json={"scan": scan_payload, "config": config_payload, "agent_version": "0.1.0", "source_host": "laptop", "consent": True}, headers={"X-NetProof-Key": org_key})
 check("report ok", r.status_code == 200 and r.json().get("ok"))
 report_id = r.json()["report_id"]
 
@@ -137,7 +157,7 @@ check("validate-agent verdict", r.json()["summary"]["verdict"] in ("pass", "warn
 check("validate-agent provenance", r.json()["provenance"]["model_source"]["mode"] == "agent")
 
 # Re-post invalidates cache, confirmed count drops to 0
-r = c.post("/api/agent/report", json={"scan": scan_payload, "config": {}, "agent_version": "0.1.0"}, headers={"X-NetProof-Key": org_key})
+r = c.post("/api/agent/report", json={"scan": scan_payload, "config": {}, "agent_version": "0.1.0", "consent": True}, headers={"X-NetProof-Key": org_key})
 r2 = c.get(f"/api/network?org={org_id}")
 check("new report invalidates cache (confirmed rules drop to 0)", r2.json()["confirmations"]["rules"]["confirmed"] == 0)
 

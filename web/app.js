@@ -23,6 +23,84 @@ const TYPE_COLORS = {
 
 const DTYPE_ORDER = ["router", "switch", "server", "host", "printer", "cloud"];
 
+/* ---------------- glossary tooltips (plain-English terms) ---------------- */
+const GLOSSARY = {
+  acl: { title: "ACL — access control list", body: "An ordered list of permit/deny rules attached to an interface (or policy point). Traffic is matched top-down; the first rule that fits decides the packet's fate." },
+  bgp: { title: "BGP — Border Gateway Protocol", body: "The routing protocol networks use to exchange prefixes with neighbors. NetProof checks a BGP change as reachability: what gets advertised, and what the network does with those routes." },
+  ospf: { title: "OSPF — Open Shortest Path First", body: "An interior routing protocol that floods link state between routers and picks shortest paths. Advertising a network here makes every router in the area try to route toward it." },
+  vlan: { title: "VLAN — Virtual LAN", body: "A logical slice of a switch. Assigning a port to a VLAN moves that device into the VLAN's broadcast domain and (usually) into a new zone." },
+  nat: { title: "NAT — Network Address Translation", body: "Rewriting addresses as traffic crosses a device. Port-forwarding (destination NAT) maps a public port to an internal host:port — but it only works if policy also lets the inbound path through." },
+  guardrail: { title: "Guardrail", body: "A policy check that runs before the referee verdict. If a guardrail trips at critical severity, it can override the engine and force a block verdict no matter what the trust score says." },
+  confirmed: { title: "Confirmed", body: "This rule or value was matched against the actual device config the agent pulled — there's proof it exists there, so trust is high." },
+  inferred: { title: "Inferred", body: "This rule or value was deduced from discovery (probed behavior), not read from device config. It's the model's best guess — treat it with more caution." },
+  zone: { title: "Zone", body: "A logical group of devices that share a purpose and reachability profile (e.g. “user”, “app”). Zones are the source/destination labels used to prove who can reach whom." },
+  snmp: { title: "SNMP — Simple Network Management Protocol", body: "The protocol the Live scan uses to query devices (the community string “public” is read-only on most gear). Used for discovery — never for changes." },
+  intent: { title: "Intent", body: "A change described in plain English. The parser converts it into a structured change for the referee to validate; nothing is applied to a device." },
+  verdict: { title: "Verdict", body: "The referee's conclusion after replaying the change over the modeled network: pass (safe), warn (needs review) or block (do not apply). Always a dry run." },
+  critical: { title: "Critical finding", body: "Caused by this change: connectivity or policy that worked before (or was required to work) stops working after it." },
+  warning: { title: "Warning finding", body: "Already true before this change (pre-existing) and not made worse by it — or new exposure that needs a human decision. It won't go away on its own; fix it separately if you want it gone." },
+};
+
+function glossHtml(key, text) {
+  return GLOSSARY[key]
+    ? `<span class="glossary-term" data-gloss="${key}" role="tooltip" tabindex="0">${text}</span>`
+    : text;
+}
+
+function wireGlossary() {
+  let pop = document.getElementById("gloss-pop");
+  if (pop) return;
+  pop = document.createElement("div");
+  pop.id = "gloss-pop";
+  pop.className = "gloss-pop";
+  pop.hidden = true;
+  document.body.appendChild(pop);
+  let target = null;
+
+  function showPop(el) {
+    const d = GLOSSARY[el.getAttribute("data-gloss")];
+    if (!d) { hidePop(); return; }
+    pop.innerHTML = `<b>${d.title}</b><span>${d.body}</span>`;
+    pop.hidden = false;
+    const r = el.getBoundingClientRect();
+    const left = Math.min(Math.max(8, r.left + r.width / 2 - pop.offsetWidth / 2), window.innerWidth - pop.offsetWidth - 8);
+    let top = r.top - pop.offsetHeight - 10;
+    if (top < 8) top = r.bottom + 10;
+    pop.style.left = left + "px";
+    pop.style.top = top + "px";
+  }
+  function hidePop() { pop.hidden = true; target = null; }
+
+  document.addEventListener("pointerover", (e) => {
+    const el = e.target && e.target.closest ? e.target.closest("[data-gloss]") : null;
+    if (!el || el === target) return;
+    target = el;
+    showPop(el);
+  });
+  document.addEventListener("pointerout", (e) => {
+    if (target && (!e.relatedTarget || !e.relatedTarget.closest || !e.relatedTarget.closest("#gloss-pop"))) hidePop();
+  });
+  document.addEventListener("click", (e) => {
+    const el = e.target && e.target.closest ? e.target.closest("[data-gloss]") : null;
+    if (el) {
+      if (target === el && !pop.hidden) { hidePop(); return; }
+      target = el;
+      showPop(el);
+    } else if (!(e.target && e.target.closest && e.target.closest("#gloss-pop"))) {
+      hidePop();
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    const el = e.target && e.target.closest ? e.target.closest("[data-gloss]") : null;
+    if (el && (e.key === "Enter" || e.key === " ")) {
+      e.preventDefault();
+      if (target === el && !pop.hidden) { hidePop(); return; }
+      target = el;
+      showPop(el);
+    }
+  });
+}
+
 let MODE = "demo";
 let NET = null;        // demo model + presets
 let SCAN = null;       // last scan discovery (raw)
@@ -30,6 +108,7 @@ let LIVE_NET = null;   // scanned model
 let AGENT_NET = null;  // /api/network?org= for the selected account
 let ORGS = [];         // all accounts
 let ACTIVE_ORG = null; // selected account id
+let AUTHED = false;    // dashboard session (isset /api/session)
 let recent = [];
 let report = null;
 let nodeCoords = {};   // device name -> {x,y}
@@ -37,6 +116,90 @@ let deviceByZone = {}; // zone name -> device name
 let scanByIp = {};     // raw scan device lookup by ip
 
 init();
+
+/* ---------------- dashboard auth (login / logout) ---------------- */
+const SESSION_OK_401 = "authentication required";
+
+async function checkAuth() {
+  try {
+    const r = await (await fetch("/api/session")).json();
+    AUTHED = !!(r && r.authenticated);
+    window.__authRole = r && r.role ? r.role : null;
+    window.__authOrg = r ? (r.org_id || "") : "";
+  } catch (e) { AUTHED = false; window.__authRole = null; window.__authOrg = ""; }
+  renderAuth();
+}
+
+function renderAuth() {
+  const user = $("auth-user"), lg = $("btn-login"), lo = $("btn-logout"), f = $("login-form");
+  if (user) { user.hidden = !AUTHED; if (AUTHED) user.textContent = "● " + window.__authUser + " · " + (window.__authRole || "?"); }
+  if (lg) lg.hidden = AUTHED;
+  if (lo) lo.hidden = !AUTHED;
+  if (f && !f.hidden && AUTHED) f.hidden = true;
+  const agentBox = $("agent-org");
+  if (agentBox && agentBox.options.length === 1 && !AUTHED) {
+    agentBox.innerHTML = `<option value="">(login to manage accounts)</option>`;
+  }
+  const usersCard = $("users-card");
+  if (usersCard) {
+    usersCard.hidden = !(AUTHED && window.__authRole === "admin");
+    if (!usersCard.hidden) renderUsers();
+  }
+}
+
+function wireAuth() {
+  const lg = $("btn-login"), lo = $("btn-logout"), go = $("login-go");
+  if (lg) lg.addEventListener("click", () => { const f = $("login-form"); if (f) f.hidden = !f.hidden; });
+  if (lo) lo.addEventListener("click", logout);
+  if (go) go.addEventListener("click", login);
+  const pass = $("login-pass");
+  if (pass) pass.addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
+  const ugo = $("user-create-go");
+  if (ugo) ugo.addEventListener("click", createUser);
+  const unb = $("user-new-btn");
+  if (unb) unb.addEventListener("click", () => {
+    const uc = $("user-create");
+    if (uc) uc.hidden = !uc.hidden;
+  });
+}
+
+function requireLogin() {
+  toast("Login required — use the Login button (top right).", true);
+  const f = $("login-form");
+  if (f) { f.hidden = false; const u = $("login-user"); if (u) u.focus(); }
+}
+
+async function login() {
+  const u = ($("login-user").value || "").trim(), p = $("login-pass").value;
+  if (!u || !p) { toast("Enter a username and password.", true); return; }
+  try {
+    const r = await fetch("/api/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: u, password: p }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) { toast("Login failed: " + (data.detail || "bad credentials"), true); return; }
+    window.__authUser = data.username || u;
+    window.__authRole = data.role || null;
+    window.__authOrg = data.org_id || "";
+    AUTHED = true;
+    await checkAuth();
+    toast(`Signed in as ${window.__authUser}.`);
+    if (MODE === "agent") await selectActiveOrg();
+  } catch (e) { toast("Login failed: " + e.message, true); }
+}
+
+async function logout() {
+  try { await fetch("/api/logout", { method: "POST" }); } catch (e) {}
+  window.__authUser = null;
+  window.__authRole = null;
+  AUTHED = false;
+  AGENT_NET = null;
+  saveActiveOrg(null);
+  await checkAuth();
+  renderAgentPanel();
+  toast("Signed out.");
+}
 
 async function init() {
   try {
@@ -46,10 +209,16 @@ async function init() {
     return;
   }
   wireStatic();
+  wireAuth();
+  wireGlossary();
+  wireUx();
   buildPresets();
   wireForm();
+  await checkAuth();
   await setMode(resumeMode());
   wireScan();
+  applyUxMode(resumeUxMode());
+  maybeShowWalkthrough();
   const dd = $("demo-dismiss");
   if (dd) dd.addEventListener("click", () => {
     try { sessionStorage.setItem("netproof-demo-dismissed", "1"); } catch (e) {}
@@ -477,9 +646,9 @@ function kv(key, val, mono) {
 
 function srcBadge(source) {
   if (source === "confirmed") {
-    return `<span class="src-badge confirmed" title="matched against the device config the agent pulled">CONFIRMED</span>`;
+    return `<span class="src-badge confirmed" data-gloss="confirmed" title="matched against the device config the agent pulled">CONFIRMED</span>`;
   }
-  return `<span class="src-badge inferred" title="inferred from discovery — not present in the device config">inferred</span>`;
+  return `<span class="src-badge inferred" data-gloss="inferred" title="inferred from discovery — not present in the device config">inferred</span>`;
 }
 
 function renderDetail(dev, raw) {
@@ -633,29 +802,44 @@ function wireScan() {
     if (!target) { toast("Enter the router/server IP or CIDR to scan.", true); return; }
     const btn = $("scan-btn");
     btn.disabled = true;
-    btn.textContent = "Discovering… (ARP, ping sweep, service ports)";
+    btn.textContent = "Running… discover + read config";
     $("scan-note").textContent = "Scanning — this can take 10-30s depending on subnet size…";
     clearSuggestions();
     try {
+      const body = { target, community: $("scan-community").value.trim() || "public", ping: true, consent: !!($("scan-consent") && $("scan-consent").checked) };
+      const file = $("scan-cfg-file").files && $("scan-cfg-file").files[0];
+      if (file) body.config_file = await file.text();
+      const sshUser = ($("scan-ssh-user") && $("scan-ssh-user").value.trim()) || "";
+      const sshPass = ($("scan-ssh-pass") && $("scan-ssh-pass").value) || "";
+      if (sshUser || sshPass) body.ssh = { user: sshUser, password: sshPass };
+      if (!body.consent) { toast("Tick the authorization box first.", true); btn.disabled = false; btn.textContent = "Run"; return; }
       const res = await fetch("/api/scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ target, community: $("scan-community").value.trim() || "public", ping: true }),
+        body: JSON.stringify(body),
       });
+      if (res.status === 401) {
+        requireLogin();
+        throw new Error("you must sign in first — use the Login button (top right)");
+      }
       if (!res.ok) throw new Error((await res.json()).detail || "scan failed");
       SCAN = await res.json();
       await loadLiveModel();
-      $("scan-note").textContent = `Found ${SCAN.devices.length} live system(s) on ${SCAN.network} in ${SCAN.seconds}s. ` + (SCAN.notes || []).slice(0, 2).join(" ");
+      const cfg = (SCAN.config_sources || []).length ? ` · rules imported (${(SCAN.config_sources || []).join(" + ")})` : "";
+      $("scan-note").textContent = `Found ${SCAN.devices.length} live system(s) on ${SCAN.network} in ${SCAN.seconds}s${cfg}. ` + (SCAN.notes || []).slice(0, 2).join(" ");
       toast(`Scan complete — ${SCAN.devices.length} system(s) discovered on ${SCAN.network}`);
     } catch (e) {
       /* nothing found / scan failed: never leave the previous network's
          suggestions behind, or the UI looks like it reports the wrong net */
-      $("scan-note").textContent = "No devices found on that network — nothing to show. The previous details were cleared.";
+      const needAuth = /sign in/i.test(e.message);
+      $("scan-note").textContent = needAuth
+        ? "Sign in first (Login, top right), then run the discovery again."
+        : "No devices found on that network — nothing to show. The previous details were cleared.";
       $("devices-card").hidden = true;
       toast("Scan failed: " + e.message, true);
     }
     btn.disabled = false;
-    btn.textContent = "Discover connected systems";
+    btn.textContent = "Run";
   });
 }
 
@@ -840,8 +1024,14 @@ function resumeActiveOrg() {
 
 async function loadOrgs() {
   try {
-    const r = await (await fetch("/api/orgs")).json();
-    ORGS = r.orgs || [];
+    const res = await fetch("/api/orgs");
+    if (res.status === 401) {
+      ORGS = [];
+      requireLogin();
+      renderAuth();
+      return;
+    }
+    ORGS = (await res.json()).orgs || [];
   } catch (e) {
     ORGS = [];
   }
@@ -865,12 +1055,14 @@ function renderAgentPanel() {
       <div class="onboard-stage">No agent report yet for <b>${esc(AGENT_NET.org || ACTIVE_ORG || "this account")}</b>.</div>
       <div class="onboard-steps">
         <div class="onboard-step"><b>1</b> Copy this account's API key below and store it on the machine inside the network.</div>
-        <div class="onboard-step"><b>2</b> Run the agent there (it only talks outbound over HTTPS):</div>
+        <div class="onboard-step"><b>2</b> Run the agent there (it only talks outbound over HTTPS). Rules come from a config snapshot (A) and/or a direct SSH read (B):</div>
       </div>
       <pre class="agent-cmd">python agent/agent.py --target &lt;router-ip&gt; \\
   --backend http://&lt;this-server&gt;:8000 \\
-  --api-key &lt;KEY&gt; [--config-file device-config.json]</pre>
-      <p class="muted" style="font-size:12px">The agent discovers the segment, attaches any confirmed device config, and pushes the report to <span class="mono">/api/agent/report</span>. Once it checks in, this panel fills with the network. You can also schedule it with <span class="mono">--interval 900</span>.</p>`;
+  --api-key &lt;KEY&gt; \\
+  [--config-file device-config.json]            # A: import a config snapshot \\
+  [--ssh --ssh-user &lt;user&gt; --ssh-password &lt;pwd&gt;] # B: read config over SSH</pre>
+      <p class="muted" style="font-size:12px">Option A imports an exported config JSON (reliable). Option B logs into the device (<span class="mono">--ssh-host</span> defaults to the router IP; unknown host keys are rejected) and parses its ACLs/routes. Both can be combined — matched rules get <span class="src-badge confirmed">CONFIRMED</span> labels. Schedule with <span class="mono">--interval 900</span>.</p>`;
   } else {
     onboard.hidden = true;
     rep.hidden = false;
@@ -882,7 +1074,7 @@ function renderAgentPanel() {
         <span><b>${conf.routes ? conf.routes.confirmed + "/" + conf.routes.inferred : "–/–"}</b> routes conf/infer</span>
         <span>report ${esc(AGENT_NET.reported_at || "")}</span>
       </div>
-      <p class="muted" style="font-size:12px">Subnet ${esc(String(AGENT_NET.scan_summary && AGENT_NET.scan_summary.subnet || ""))} · target ${esc(String(AGENT_NET.scan_summary && AGENT_NET.scan_summary.target || ""))}. Config-matched entries carry a <span class="src-badge confirmed">CONFIRMED</span> badge in device details.</p>`;
+      <p class="muted" style="font-size:12px">Subnet ${esc(String(AGENT_NET.scan_summary && AGENT_NET.scan_summary.subnet || ""))} · target ${esc(String(AGENT_NET.scan_summary && AGENT_NET.scan_summary.target || ""))}. Config-matched entries carry a <span class="src-badge confirmed">CONFIRMED</span> badge in device details.${AGENT_NET.config_sources && AGENT_NET.config_sources.length ? ` Rules imported via <span class="mono">${esc(AGENT_NET.config_sources.join(" + "))}</span>.` : ""}</p>`;
   }
   if (tip) tip.hidden = true;
 }
@@ -900,6 +1092,12 @@ async function selectActiveOrg() {
   saveActiveOrg(id);
   try {
     const r = await fetch("/api/network?org=" + encodeURIComponent(id));
+    if (r.status === 401) {
+      AGENT_NET = null;
+      requireLogin();
+      renderAgentPanel();
+      return;
+    }
     if (!r.ok) throw new Error((await r.json()).detail || "no account data");
     AGENT_NET = await r.json();
     deviceByZone = {};
@@ -929,6 +1127,11 @@ async function createOrg() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
     });
+    if (res.status === 401) {
+      requireLogin();
+      btn.disabled = false; btn.textContent = "Create";
+      return;
+    }
     if (!res.ok) throw new Error((await res.json()).detail || "create failed");
     const org = (await res.json()).org;
     await loadOrgs();
@@ -953,12 +1156,77 @@ function showKeyOnce(key) {
     <div class="onboard-stage">Account created + API key generated (shown once):</div>
     <pre class="agent-key">${esc(key)}</pre>
     <button type="button" class="btn btn-secondary" id="agent-copy-key">⧉ Copy key</button>
-    <p class="muted" style="font-size:12px">Store it in the agent install inside the network. Paste the config snapshot path with <span class="mono">--config-file</span> to get <span class="src-badge confirmed">CONFIRMED</span> labels.</p>`;
+    <p class="muted" style="font-size:12px">Store it in the agent install inside the network. To get real rules marked <span class="src-badge confirmed">CONFIRMED</span>, run the agent with a config snapshot (<span class="mono">--config-file</span>) and/or an SSH read (<span class="mono">--ssh --ssh-user &lt;user&gt; --ssh-password &lt;pwd&gt;</span>).</p>`;
   const cp = $("agent-copy-key");
   if (cp) cp.addEventListener("click", () => {
     try { navigator.clipboard.writeText(key); toast("API key copied"); }
     catch (e) { toast("Copy failed — select the key text manually.", true); }
   });
+}
+
+/* ---------------- users & roles (admin) ---------------- */
+async function renderUsers() {
+  const list = $("users-list");
+  if (!list) return;
+  if (!ORGS.length) await loadOrgs();
+  const orgSel = $("user-org");
+  if (orgSel && ORGS.length && orgSel.options.length === 0) {
+    orgSel.innerHTML = ORGS.map((o) => `<option value="${esc(o.id)}">${esc(o.name)}</option>`).join("");
+  }
+  let users = [];
+  try {
+    const res = await fetch("/api/users");
+    if (res.status === 401 || res.status === 403) { list.innerHTML = "<p class='muted'>Login as admin to manage users.</p>"; return; }
+    if (!res.ok) throw new Error("load failed");
+    users = (await res.json()).users || [];
+  } catch (e) { list.innerHTML = "<p class='muted'>Could not load users.</p>"; return; }
+  const orgName = (id) => { const o = ORGS.find((x) => x.id === id); return o ? o.name : id; };
+  list.innerHTML = users.length ? `
+    <table class="users-table">
+      <tr><th>User</th><th>Role</th><th>Created</th><th></th></tr>
+      ${users.map((u) => `
+        <tr>
+          <td><div class="u-name mono">${esc(u.username)}</div><div class="u-org">${esc(orgName(u.org_id))}</div></td>
+          <td><span class="src-badge ${u.role === "admin" ? "edgy" : u.role === "operator" ? "confirmed" : "inferred"}">${esc(u.role)}</span></td>
+          <td class="dim">${esc(String(u.created_at || "").replace("T", " ").slice(0, 19))}</td>
+          <td><button type="button" class="btn-clear" title="Delete user" data-del-user="${esc(u.org_id)}|${esc(u.username)}">✕</button></td>
+        </tr>`).join("")}
+    </table>` : "<p class='muted'>No users yet — create the first one below.</p>";
+  list.querySelectorAll("[data-del-user]").forEach((b) => b.addEventListener("click", () => deleteUser(b.dataset.delUser)));
+}
+
+async function createUser() {
+  const org_id = ($("user-org").value || "").trim();
+  const username = ($("user-username").value || "").trim();
+  const password = $("user-password").value;
+  const role = $("user-role").value;
+  if (!username || !password) { toast("Username and password are required.", true); return; }
+  if (password.length < 10) { toast("Password must be at least 10 characters.", true); return; }
+  try {
+    const res = await fetch("/api/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ org_id, username, password, role }),
+    });
+    if (res.status === 401) { requireLogin(); return; }
+    if (res.status === 403) { toast("Only an admin can create users.", true); return; }
+    if (!res.ok) throw new Error((await res.json()).detail || "create failed");
+    $("user-username").value = ""; $("user-password").value = "";
+    toast(`User "${username}" created with role ${role}.`);
+    await renderUsers();
+  } catch (e) { toast("Create user failed: " + e.message, true); }
+}
+
+async function deleteUser(key) {
+  const [org_id, username] = key.split("|");
+  if (!confirm(`Delete user "${username}"? Their login and live sessions will be revoked.`)) return;
+  try {
+    const res = await fetch("/api/users/" + encodeURIComponent(org_id) + "/" + encodeURIComponent(username), { method: "DELETE" });
+    if (res.status === 403) { toast("Only an admin can delete users.", true); return; }
+    if (!res.ok) throw new Error((await res.json()).detail || "delete failed");
+    toast(`User "${username}" deleted.`);
+    await renderUsers();
+  } catch (e) { toast("Delete failed: " + e.message, true); }
 }
 
 /* ---------------- change builder ---------------- */
@@ -1113,7 +1381,7 @@ function fillPolicySelects() {
     if (title) o.title = title;
     sel.appendChild(o);
   };
-  const routeDevs = (m.devices || []).filter((d) => ["router", "switch"].includes(d.type) && d.routes.length);
+  const routeDevs = (m.devices || []).filter((d) => ["router", "switch", "firewall"].includes(d.type) && d.routes.length);
   const rsel = $("r-device");
   rsel.innerHTML = "";
   routeDevs.slice().sort(devOrder).forEach((d) => option(rsel, d.name, devLabel(d) + "  ·  routing device", devTooltip(d)));
@@ -1300,6 +1568,7 @@ function refreshHint() {
   $("preset").addEventListener("change", () => {
     if ($("preset").value === "__custom") { $("preset-desc").textContent = ""; return; }
     applyPresetValue();
+    showBuilderFields();
   });
   $("ch-type").addEventListener("change", updateVisibility);
   $("f-proto").addEventListener("change", updateVisibility);
@@ -1314,6 +1583,13 @@ function refreshHint() {
   });
   $("run").addEventListener("click", run);
   $("intent-btn").addEventListener("click", () => parseIntentFromBox());
+  const intentEl = $("intent");
+  const autoGrowIntent = () => {
+    intentEl.style.height = "auto";
+    intentEl.style.height = Math.min(intentEl.scrollHeight, 220) + "px";
+  };
+  intentEl.addEventListener("input", autoGrowIntent);
+  autoGrowIntent();
   $("reset-btn").addEventListener("click", resetAll);
   document.querySelectorAll("#mode-switch button").forEach((b) =>
     b.addEventListener("click", () => setMode(b.dataset.mode)));
@@ -1354,6 +1630,7 @@ async function parseIntentFromBox() {
     if (!res.ok) throw new Error((await res.json()).detail || "couldn't parse");
     const parsed = await res.json();
     loadChange(parsed.change);
+    showBuilderFields();
     $("preset").value = "__custom";
     $("preset-desc").textContent = "";
     const c = Math.round(parsed.confidence * 100);
@@ -1375,6 +1652,84 @@ function wireStatic() {
   // networks into our suggestion fields — it directly caused the repeated /
   // wrong ".0" and old-device entries the user saw.
   ["scan-target", "scan-community", "f-src", "f-dst", "r-network", "r-nh"].forEach(wipeBrowserMemory);
+}
+
+/* ---------------- beginner-friendly: view mode (simple / expert) ---------------- */
+function resumeUxMode() { try { return sessionStorage.getItem("netproof-ux") || "simple"; } catch (e) { return "simple"; } }
+function saveUxMode(m) { try { sessionStorage.setItem("netproof-ux", m); } catch (e) {} }
+
+function applyUxMode(m) {
+  const simple = m !== "expert";
+  document.body.classList.toggle("ux-simple", simple);
+  document.body.classList.toggle("ux-expert", !simple);
+  const sw = $("ux-switch");
+  if (sw) sw.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.dataset.ux === (simple ? "simple" : "expert")));
+  const adv = $("show-advanced");
+  if (adv) adv.hidden = !simple;
+  if (simple) {
+    const cf = document.querySelector(".change-form");
+    if (cf && !cf.classList.contains("fields-open")) cf.classList.add("fields-hidden");
+  }
+  const hl = $("ux-hint");
+  if (hl) {
+    hl.textContent = simple
+      ? "Simple view — plain-English first. Every control stays a tap away."
+      : "Expert view — every control and technical detail is visible.";
+  }
+}
+
+function wireUx() {
+  const sw = $("ux-switch");
+  if (sw) sw.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { saveUxMode(b.dataset.ux); applyUxMode(b.dataset.ux); }));
+  const tb = $("tour-btn");
+  if (tb) tb.addEventListener("click", showWalkthrough);
+  const adv = $("show-advanced");
+  if (adv) adv.addEventListener("click", showBuilderFields);
+}
+
+function showBuilderFields() {
+  const cf = document.querySelector(".change-form");
+  if (cf) { cf.classList.add("fields-open"); cf.classList.remove("fields-hidden"); }
+  const adv = $("show-advanced");
+  if (adv) adv.hidden = true;
+}
+
+/* ---------------- beginner-friendly: 4-step first-run walkthrough ---------------- */
+function maybeShowWalkthrough() {
+  try {
+    if (localStorage.getItem("netproof-walkthrough-dismissed") === "1") return;
+  } catch (e) { return; }
+  showWalkthrough();
+}
+
+function showWalkthrough() {
+  const ov = $("walkthrough");
+  if (!ov) return;
+  ov.hidden = false;
+  const steps = Array.from(ov.querySelectorAll(".wt-step"));
+  const dots = $("wt-dots");
+  const prog = $("wt-progress");
+  const prev = $("wt-prev");
+  const nxt = $("wt-next");
+  let i = 0;
+  const dismiss = () => {
+    try { localStorage.setItem("netproof-walkthrough-dismissed", "1"); } catch (e) {}
+    ov.hidden = true;
+  };
+  const render = () => {
+    steps.forEach((s, k) => { s.hidden = k !== i; });
+    if (dots) dots.innerHTML = steps.map((_, k) => `<span class="wt-dot${k === i ? " active" : ""}"></span>`).join("");
+    if (prog) prog.textContent = `step ${i + 1} of ${steps.length}`;
+    if (prev) prev.disabled = i === 0;
+    if (nxt) nxt.textContent = i === steps.length - 1 ? "Got it — start" : "Next →";
+  };
+  if (prev) prev.onclick = () => { if (i > 0) { i--; render(); } };
+  if (nxt) nxt.onclick = () => { if (i < steps.length - 1) { i++; render(); } else dismiss(); };
+  const sk = $("wt-skip");
+  if (sk) sk.onclick = dismiss;
+  const cl = $("wt-close");
+  if (cl) cl.onclick = dismiss;
+  render();
 }
 
 function wireAgent() {
@@ -1429,10 +1784,70 @@ function syncFields() {
 function num(v) { const n = parseInt(v.value, 10); return Number.isFinite(n) ? n : 0; }
 
 /* ---------------- run / validate ---------------- */
+function setRunIdle(btn) {
+  btn.disabled = false;
+  btn.innerHTML = `<span>Run validation</span><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>`;
+}
+
+function riskSummary(change, checks) {
+  const crits = (checks || []).filter((c) => c.severity === "critical");
+  if (crits.length) {
+    return {
+      title: "Guardrail flags this as high-risk",
+      body: crits.map((c) => c.title).join("; ") + " — the referee can still evaluate it as a dry run, but the result will block. Run it anyway?",
+    };
+  }
+  if (change && /^remove_|^replace_/.test(change.type)) {
+    return {
+      title: "This change removes or replaces configuration",
+      body: esc(describeChange(change)) + " — the referee may flag critical findings if something depended on it. Run the dry run anyway?",
+    };
+  }
+  if (change && change.type === "add_route" && change.route && change.route.network === "0.0.0.0/0") {
+    return {
+      title: "Re-pointing the default route",
+      body: "This redirects every packet with no more-specific path. If the next hop is unreachable, most of the network goes down. Run it anyway?",
+    };
+  }
+  return null;
+}
+
+function confirmRisk(risk) {
+  return new Promise((resolve) => {
+    const ov = document.createElement("div");
+    ov.className = "dialog-overlay";
+    ov.innerHTML = `
+      <div class="dialog-card">
+        <h3>⚠ ${esc(risk.title)}</h3>
+        <p>${risk.body}</p>
+        <p style="margin-top:6px;color:var(--faint);font-size:12px">Validation is always a <b>dry run</b> — it only computes what would change; nothing is ever pushed to a device.</p>
+        <div class="dialog-acts">
+          <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+          <button type="button" class="btn" data-act="go">Yes — run the dry run</button>
+        </div>
+      </div>`;
+    document.body.appendChild(ov);
+    const done = (v) => { ov.remove(); resolve(v); };
+    ov.querySelector('[data-act="cancel"]').addEventListener("click", () => done(false));
+    ov.querySelector('[data-act="go"]').addEventListener("click", () => done(true));
+    ov.addEventListener("click", (e) => { if (e.target === ov) done(false); });
+    document.addEventListener("keydown", function escH(e) {
+      if (e.key === "Escape") { document.removeEventListener("keydown", escH); done(false); }
+    });
+  });
+}
+
 async function run() {
   const btn = $("run");
   const change = collectChange();
   btn.disabled = true;
+  btn.innerHTML = `<span class="spinner"></span>&nbsp; Checking guardrails…`;
+  const checks = await fetchGuardrails(change);
+  const risk = riskSummary(change, checks);
+  if (risk) {
+    const ok = await confirmRisk(risk);
+    if (!ok) { toast("Cancelled — nothing was validated (dry run only)."); setRunIdle(btn); return; }
+  }
   btn.innerHTML = `<span class="spinner"></span>&nbsp; Reasoning the change…`;
   try {
     const res = await fetch("/api/validate", {
@@ -1448,20 +1863,18 @@ async function run() {
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
     report = await res.json();
     report.change = change;
-    fetchGuardrails(change).then((checks) => { report.guardrails = checks; renderGuardrails(checks); });
+    report.guardrails = checks;
   } catch (e) {
     toast("Validation failed: " + e.message, true);
-    btn.disabled = false;
-    btn.innerHTML = `<span>Run validation</span>`;
+    setRunIdle(btn);
     return;
   }
-  btn.disabled = false;
-  btn.innerHTML = `<span>Run validation</span><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>`;
+  setRunIdle(btn);
   renderResult(report);
+  renderGuardrails(report.guardrails);
   renderRequirements(model().requirements, report);
   recordRecent(report);
   $("result").scrollIntoView({ behavior: "smooth", block: "nearest" });
-  // scroll map into view and start the live-flow overlay
   const topoCard = document.querySelector(".topo-card");
   if (topoCard) topoCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
   startTopoFlowOverlay(report);
@@ -1545,9 +1958,31 @@ function renderResult(report) {
         <span class="mono dim">${s.blocked} critical · ${s.warnings} warnings · ${s.info} info</span></div>
       ${report.summary.guardrail_block ? `<p class="verdict-sub" style="color:var(--danger);font-weight:600">Guardrail override — engine verdict <span class="mono">${esc(report.summary.engine_verdict || "?")}</span> (${report.summary.engine_score ?? "?"} trust) was overridden to block by policy guardrails.</p>` : ""}
       <p class="verdict-sub">${esc(describeChange(report.change))} — verified over <span class="mono">${s.flows_checked}</span> flows.</p>
-      <p class="verdict-sub" style="color:${s.verdict === "pass" ? "var(--pass)" : s.verdict === "warn" ? "var(--warn)" : "var(--danger)"}">${s.verdict === "pass" ? "Behavior-preserving for every checked flow." : s.blocked ? "Connectivity or policy is broken for the flows below." : "New exposure needs human confirmation."}</p>
+      <p class="verdict-sub">${esc(describeChange(report.change))} — verified over <span class="mono">${s.flows_checked}</span> flows.</p>
     </div>`;
   box.appendChild(hero);
+
+  const plain = document.createElement("div");
+  plain.className = "verdict-plain";
+  {
+    const nWarn = (report.findings || []).filter((f) => f.severity === "warning").length;
+    let line;
+    if (s.verdict === "pass") {
+      line = `This change is safe to apply — none of the <b>${s.flows_checked ?? 0} flows</b> or requirements we checked change behavior.`;
+    } else if (s.verdict === "block") {
+      line = `Do not apply this change yet — <b>${s.blocked} critical finding${s.blocked > 1 ? "s" : ""}</b> ${s.blocked > 1 ? "break" : "breaks"} connectivity or violates a requirement. The Findings tab shows exactly where.`;
+    } else if (nWarn > 0 && s.blocked === 0) {
+      line = `Nothing this change touches is broken, but <b>${nWarn} warning${nWarn > 1 ? "s" : ""}</b> need a decision from you — review the Findings tab, then decide whether to apply.`;
+    } else {
+      line = `This change needs your confirmation — it opens new access or leaves a requirement loose. Review the Findings tab before you decide.`;
+    }
+    plain.innerHTML = line;
+    const legend = document.createElement("p");
+    legend.className = "verdict-sev-legend";
+    legend.innerHTML = `<b>critical</b> = caused by this change · <b>warning</b> = already true before this change (pre-existing) · <b>info</b> = heads-up`;
+    plain.appendChild(legend);
+  }
+  box.appendChild(plain);
 
   box.appendChild(buildSimPanel(report));
 
@@ -1561,7 +1996,7 @@ function renderResult(report) {
   tabs.className = "result-tabs";
   const tF = document.createElement("button"); tF.className = "tab active"; tF.dataset.tab = "findings";
   tF.innerHTML = `Findings<span class="cnt">${report.findings.length}</span>`;
-  const tM = document.createElement("button"); tM.className = "tab"; tM.dataset.tab = "matrix";
+  const tM = document.createElement("button"); tM.className = "tab"; tM.dataset.tab = "matrix"; tM.setAttribute("data-gloss", "zone");
   tM.innerHTML = `Zone reachability<span class="cnt">${Object.keys(report.matrix).length}</span>`;
   tabs.appendChild(tF); tabs.appendChild(tM);
   if (report.proposed_diff) {
@@ -2472,7 +2907,9 @@ async function simTraceStep(wrap, entry, ctl) {
   }
   if (!(await simGate(ctl))) return false;
   if (ctl !== simCancelCtl) return false;
-if (entry.by_default && hitIdx == null) {
+if (entry.established && hitIdx == null) {
+    highlightRule(wrap, "est", { action: "permit" }, true);
+  } else if (entry.by_default && hitIdx == null) {
     highlightRule(wrap, checks.length, { action: entry.default_action }, true);
   } else if (hitIdx != null) {
     const chk = checks.find((c) => c.index === hitIdx);
@@ -2499,7 +2936,10 @@ function showFilterTrace(wrap, entry) {
   box.innerHTML =
     `<div class="sim-filter-head">${esc(entry.filter || "filter")} <span class="dim">(${checks.length} rules, default: ${esc(entry.default_action || "deny")})</span></div>` +
     `<div class="sim-rules-list" id="sim-rules-list">${rules}` +
-    `<div class="sim-rule" data-idx="${checks.length}">—: [default → ${esc(entry.default_action || "deny")}]</div></div>` +
+    (entry.established
+      ? `<div class="sim-rule" data-idx="est">∞: [established return (stateful) → pass]</div>`
+      : `<div class="sim-rule" data-idx="${checks.length}">—: [default → ${esc(entry.default_action || "deny")}]</div>`) +
+    `</div>` +
     `<div class="sim-decision" id="sim-decision"></div>`;
 }
 
@@ -2517,7 +2957,9 @@ function showDecision(wrap, entry) {
   const d = wp$(wrap, "sim-decision");
   if (!d) return;
   const denied = !entry.allowed;
-  d.textContent = denied ? "✕ DENIED — packet blocked" : "✓ ALLOWED — packet passes";
+  d.textContent = entry.established
+    ? "✓ ALLOWED — established return traffic (stateful)"
+    : denied ? "✕ DENIED — packet blocked" : "✓ ALLOWED — packet passes";
   d.className = "sim-decision " + (denied ? "block" : "ok");
 }
 

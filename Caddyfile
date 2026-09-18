@@ -1,0 +1,17 @@
+# NetProof TLS reverse proxy — Caddy auto-provisions a Let's Encrypt cert
+# for the domain in $NETPROOF_DOMAIN. Started only with the "production"
+# Docker Compose profile:
+#
+#   docker compose --profile production up -d
+#
+# Without TLS (dev mode):
+#   docker compose up -d
+#
+{$NETPROOF_DOMAIN} {
+    reverse_proxy netproof:8000
+    encode gzip
+    header {
+        X-Forwarded-Proto {scheme}
+        X-Real-IP {remote_host}
+    }
+}

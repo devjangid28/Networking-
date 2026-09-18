@@ -96,6 +96,7 @@ class Filter:
     name: str
     default: str
     rules: list[Rule] = field(default_factory=list)
+    stateful: bool = False  # True = firewall policy that tracks connection state (return traffic auto-allowed)
 
 
 @dataclass
@@ -148,7 +149,7 @@ class Nat:
     def from_dict(d: dict) -> "Nat":
         return Nat(
             outside_interface=str(d["outside_interface"]),
-            inside_prefixes=[Prefix.parse(p) for p in (d.get("inside_networks") or [])],
+            inside_prefixes=[Prefix.parse(p) for p in (d.get("inside_prefixes") or d.get("inside_networks") or [])],
         )
 
 
@@ -397,6 +398,67 @@ class Net:
         candidates.sort(key=lambda c: c[0], reverse=True)
         return candidates[0][1]
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "Net":
+        """Reconstruct a ``Net`` from the canonical_snapshot JSON produced by
+        ``engine.audit.canonical_snapshot``. This is the round-trip companion
+        that makes replay deterministic even after a server restart."""
+        net = cls(name=d.get("name", "Network"), description=d.get("description", ""))
+
+        # filters
+        for fd in d.get("filters") or []:
+            f = Filter(
+                name=str(fd["name"]),
+                default=str(fd.get("default", "deny")).lower(),
+                stateful=bool(fd.get("stateful", False)),
+            )
+            f.rules = [Rule.from_dict(r) for r in (fd.get("rules") or [])]
+            net.filters[f.name] = f
+
+        # devices
+        for dd in d.get("devices") or []:
+            dev = Device(name=str(dd["name"]), dtype=str(dd.get("type", "router")))
+            for iid in dd.get("interfaces") or []:
+                if isinstance(iid, dict):
+                    iface = Interface(
+                        name=iid.get("name", "eth0"), ip=iid.get("ip"),
+                        prefix=Prefix.parse(iid["ip"]) if iid.get("ip") and "/" in str(iid.get("ip")) else None,
+                        network=iid.get("network"),
+                        filters=iid.get("filters") or [],
+                        connected_to=iid.get("connected_to"),
+                    )
+                    dev.interfaces.append(iface)
+            dev.routes = [Route.from_dict(r) for r in (dd.get("routes") or [])]
+            if dd.get("nat"):
+                dev.nat = Nat.from_dict(dd["nat"])
+            dev.dst_nat = [DstNatRule.from_dict(r) for r in (dd.get("dst_nat") or [])]
+            dev.bgp = [BgpPeer.from_dict(p) for p in (dd.get("bgp") or [])]
+            dev.ospf = [OspfArea.from_dict(a) for a in (dd.get("ospf") or [])]
+            dev.dns = [DnsRecord.from_dict(r) for r in (dd.get("dns") or [])]
+            dev.vlans = [VlanAssignment.from_dict(v) for v in (dd.get("vlans") or [])]
+            net.devices[dev.name] = dev
+
+        # zones
+        for zd in d.get("zones") or []:
+            name = zd["name"]
+            prefix = Prefix.parse(zd["prefix"]) if zd.get("prefix") else None
+            net.zones[name] = Zone(
+                name=name, prefix=prefix, gateway=zd.get("gateway", ""),
+                is_source=bool(zd.get("source")), is_dest=bool(zd.get("dest")),
+                sample_dst=zd.get("sample_dst"),
+            )
+
+        # requirements
+        for rd in d.get("requirements") or []:
+            net.requirements.append(Requirement(
+                name=rd["name"], src=rd["src"], dst=rd["dst"],
+                proto=rd["proto"], dport=rd.get("dport"),
+                expect=rd.get("expect", "reachable"),
+            ))
+
+        net.build_adjacency()
+        return net
+
 
 def parse_host_or_prefix(net: Net, addr: str) -> tuple[str, int, Prefix]:
     """Resolve an address (host IP or prefix) to (origin device, representative IP, prefix)."""
@@ -425,7 +487,11 @@ def load_net(path: str) -> Net:
     net = Net(name=data.get("name", "Network"), description=data.get("description", ""))
 
     for d in data.get("filters") or []:
-        filt = Filter(name=str(d["name"]), default=str(d.get("default", "deny")).lower())
+        filt = Filter(
+            name=str(d["name"]),
+            default=str(d.get("default", "deny")).lower(),
+            stateful=bool(d.get("stateful", False)),
+        )
         filt.rules = [Rule.from_dict(r) for r in (d.get("rules") or [])]
         net.filters[filt.name] = filt
 

@@ -8,8 +8,9 @@ from __future__ import annotations
 
 from .model import MAX_IP, Net, Prefix, Requirement, parse_host_or_prefix, ip_int, ip_str
 from .reach import apply_change, resolve_flow
+from .metainfo import PROJECT_VERSION
 
-ENGINE_VERSION = "0.3.0"
+ENGINE_VERSION = PROJECT_VERSION
 
 # Example change presets surfaced in the UI for an instant, honest demo.
 PRESETS: list[dict] = [
@@ -311,46 +312,57 @@ def _net_has_dstnat(net: Net, f: dict) -> bool:
 
 
 def _run(net: Net, flows: list[dict]) -> dict:
+    established: set[tuple] = set()
     results: dict[str, dict] = {}
-    for f in flows:
-        if f["kind"] == "dstnat":
-            has = _net_has_dstnat(net, f)
-            if not has:
-                results[f["key"]] = {
-                    "label": f["label"],
-                    "kind": f["kind"],
-                    "reachable": False,
-                    "status": "no_forward",
-                    "path": [],
-                    "steps": [],
-                    "drop": {"device": f["rule"]["device"], "detail": "port-forward rule not present on this network"},
-                    "nat": None,
-                    "src_zone": None,
-                    "dst_zone": None,
-                    "proto": f["proto"],
-                    "dport": f["dport"],
-                    "expect": f.get("expect"),
-                    "forward_present": has,
-                }
-                continue
-        res = resolve_flow(net, f["src_rep"], f["src_origin"], f["dst_ip"], f["proto"], f["dport"])
-        results[f["key"]] = {
-            "label": f["label"],
-            "kind": f["kind"],
-            "reachable": res["reachable"],
-            "status": res["status"],
-            "path": res["path"],
-            "steps": res["steps"],
-            "drop": res["drop"],
-            "nat": res["nat"],
-            "trace": res.get("trace") or [],
-            "src_zone": f.get("src_zone"),
-            "dst_zone": f.get("dst_zone"),
-            "proto": f["proto"],
-            "dport": f["dport"],
-            "expect": f.get("expect"),
-            "forward_present": f["kind"] == "dstnat",
-        }
+    # A stateful firewall auto-allows return traffic of permitted connections,
+    # so a reverse-direction flow's verdict depends on flows evaluated earlier.
+    # Iterate to a fixpoint: each pass records newly-permitted connections and
+    # the next pass re-resolves flows against the grown table. Stops once the
+    # connection table stops growing (bounded, so runs terminate quickly).
+    for _ in range(8):
+        prev_len = len(established)
+        results = {}
+        for f in flows:
+            if f["kind"] == "dstnat":
+                has = _net_has_dstnat(net, f)
+                if not has:
+                    results[f["key"]] = {
+                        "label": f["label"],
+                        "kind": f["kind"],
+                        "reachable": False,
+                        "status": "no_forward",
+                        "path": [],
+                        "steps": [],
+                        "drop": {"device": f["rule"]["device"], "detail": "port-forward rule not present on this network"},
+                        "nat": None,
+                        "src_zone": None,
+                        "dst_zone": None,
+                        "proto": f["proto"],
+                        "dport": f["dport"],
+                        "expect": f.get("expect"),
+                        "forward_present": has,
+                    }
+                    continue
+            res = resolve_flow(net, f["src_rep"], f["src_origin"], f["dst_ip"], f["proto"], f["dport"], established=established)
+            results[f["key"]] = {
+                "label": f["label"],
+                "kind": f["kind"],
+                "reachable": res["reachable"],
+                "status": res["status"],
+                "path": res["path"],
+                "steps": res["steps"],
+                "drop": res["drop"],
+                "nat": res["nat"],
+                "trace": res.get("trace") or [],
+                "src_zone": f.get("src_zone"),
+                "dst_zone": f.get("dst_zone"),
+                "proto": f["proto"],
+                "dport": f["dport"],
+                "expect": f.get("expect"),
+                "forward_present": f["kind"] == "dstnat",
+            }
+        if len(established) == prev_len:
+            break
     return results
 
 
@@ -623,9 +635,6 @@ def _check_vlan(net: Net, after: Net, change: dict) -> list[dict]:
     if not (1 <= vlan_id <= 4094):
         out.append(_cp_finding("critical", "vlan", "VLAN id out of legal range",
                                f"VLAN {vlan_id} is outside 1-4094. Switch hardware will reject this."))
-        if not out:
-            out.append(_cp_finding("critical", "vlan", "Reserved VLAN id",
-                                   f"VLAN {vlan_id} is reserved for internal/platform use."))
     prev = next((a for a in (net.devices[dev_name].vlans or []) if a.iface == iface), None)
     if vlan_id == 1:
         out.append(_cp_finding("warning", "vlan", "Assignment to the default VLAN",
@@ -683,16 +692,24 @@ def validate_change(net: Net, change: dict) -> dict:
         b, a = before[key], after[key]
 
         if f["kind"] == "requirement":
-            ok = (b["reachable"] == a["reachable"]) and (a["reachable"] == (f["expect"] == "reachable"))
-            if not ok:
-                sev = "critical"
-                if b["reachable"] == a["reachable"] and a["reachable"] != (f["expect"] == "reachable"):
-                    sev = "critical"
+            # A requirement is violated when the AFTER state fails to match its
+            # expectation. Severity deliberately reflects IMPACT: breaking a
+            # working requirement is critical; a shortfall that already existed
+            # before the change and was not touched by it is a warning so a
+            # "critical" verdict always means THIS change broke something.
+            meets_expectation = a["reachable"] == (f["expect"] == "reachable")
+            if not meets_expectation:
+                caused_by_change = b["reachable"] != a["reachable"]
+                sev = "critical" if caused_by_change else "warning"
+                detail = _requirement_summary(b, a, f)
+                if not caused_by_change:
+                    detail = ("Already failing before this change and not affected "
+                              "by it — fix it separately: ") + detail
                 findings.append({
                     "severity": sev,
                     "type": "requirement",
                     "title": f"Requirement '{f['key']}' violated",
-                    "detail": _requirement_summary(b, a, f),
+                    "detail": detail,
                     "before": b,
                     "after": a,
                     "requirement": f["key"],

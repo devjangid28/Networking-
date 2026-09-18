@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ipaddress
 import math
+import re
 
 from . import model as M
 
@@ -51,6 +52,19 @@ def _unique_name(base: str, used: set[str], ip: str) -> str:
     return s
 
 
+def _port_name(raw: str, fallback_idx: int, used: set[str]) -> str:
+    """Sanitize a real LLDP/CDP port id into a safe, unique interface name."""
+    s = re.sub(r"[^A-Za-z0-9./_-]", "_", str(raw or "")).strip()
+    if not s or len(s) > 32:
+        s = f"P{fallback_idx}"
+    base, n = s, 1
+    while s in used:
+        s = f"{base}_{n}"
+        n += 1
+    used.add(s)
+    return s
+
+
 def build_net(scan: dict, protect: set[str] | None = None) -> tuple[M.Net, dict]:
     """Returns (net, meta). Raises ValueError on structurally bad scans.
 
@@ -78,28 +92,60 @@ def build_net(scan: dict, protect: set[str] | None = None) -> tuple[M.Net, dict]
 
     # -- router ----------------------------------------------------------------
     target = next((d for d in devices if d.get("is_target")), devices[0])
+    # The raw target may be a CIDR (the UI invites "IP or CIDR"). Every use of
+    # target_ip below expects a bare host address, so resolve the address the
+    # scanner flagged as the target; a CIDR would otherwise yield "a.b.c.d/24/24"
+    # and crash Prefix.parse.
+    target_ip = target.get("ip") or target_ip.split("/")[0]
     router_name = _unique_name(target.get("hostname") or target_ip, used, target_ip)
     router = M.Device(name=router_name, dtype="router", x=CX, y=CY)
     router.routes.append(M.Route.from_dict({"network": "0.0.0.0/0", "next_hop": UPLINK_GW}))
     net.devices[router.name] = router
 
+    # -- real physical link map from the LLDP/CDP tables on the target ---------
+    # A sweep alone cannot see links, so this is best-effort ground truth: match
+    # the target's reported neighbors to the scanned inventory (by sysName or
+    # hostname). Matched devices get their REAL port names from the neighbor
+    # tables; unmatched ones fall back to the synthetic star. When nothing
+    # matches, the whole build stays the honest router-centric star.
+    neighbors = scan.get("neighbors") or []
+    by_name: dict[str, dict] = {}
+    for _d in devices:
+        sn = (_d.get("snmp") or {}).get("sysName") or ""
+        hn = _d.get("hostname") or ""
+        if sn:
+            by_name.setdefault(sn.strip().lower(), _d)
+        if hn:
+            by_name.setdefault(hn.strip().lower(), _d)
+
+    matched: dict[str, dict] = {}  # device ip -> neighbor entry
+    for nb in neighbors:
+        want = str(nb.get("remote_sysname") or nb.get("remote_device_id") or "").strip().lower()
+        dev = by_name.get(want)
+        if dev is None or dev.get("ip") == target_ip or dev.get("ip") in matched:
+            continue
+        matched[dev["ip"]] = nb
+    real_links = bool(matched)
+
     # -- link-facing interfaces on the router (one per discovered system) ------
     lan_ifaces = []
+    used_ports: set[str] = set()
     for idx, d in enumerate(devices):
         ip = d.get("ip")
         if not ip:
             continue
-        iface_name = f"Eth{idx}"
+        nb = matched.get(ip)
+        iface_name = _port_name(str(nb.get("local_port")), idx, used_ports) if nb else f"Eth{idx}"
         # ip carries the CIDR so Interface.from_dict derives a real /24 prefix
         # (a bare IP alone would silently become a /32 and break connected-route
         # delivery for same-subnet neighbours).
         lan = M.Interface.from_dict(iface_name, {"ip": f"{target_ip}/{cidr.prefixlen}", "network": cidr.with_prefixlen, "label": d.get("vendor", ""), "filters": ["router-lan-in"], "connected_to": "HOLD"})
         router.interfaces.append(lan)
         lan.connected_to = None  # fixed below after neighbor names resolve
-        lan_ifaces.append((lan, ip, d))
+        lan_ifaces.append((lan, ip, d, nb))
 
     # -- orbit geometry (needed before cloud placement) -------------------------
-    others = [(lan, ip, d) for (lan, ip, d) in lan_ifaces if ip != target_ip]
+    others = [(lan, ip, d, nb) for (lan, ip, d, nb) in lan_ifaces if ip != target_ip]
     n_others = max(len(others), 1)
     min_arc = 110
     min_rx = int(n_others * min_arc / (2 * math.pi))
@@ -114,7 +160,7 @@ def build_net(scan: dict, protect: set[str] | None = None) -> tuple[M.Net, dict]
     net.devices[cloud.name] = cloud
 
     # -- every other system -----------------------------------------------------
-    for idx, (lan, ip, d) in enumerate(others):
+    for idx, (lan, ip, d, nb) in enumerate(others):
         base = d.get("hostname")
         dtype = d.get("type_guess")
         if dtype not in ("router", "switch", "host", "server", "printer", "camera", "mobile", "laptop", "phone"):
@@ -124,12 +170,13 @@ def build_net(scan: dict, protect: set[str] | None = None) -> tuple[M.Net, dict]
         angle = 2 * math.pi * idx / n_others
         dev = M.Device(name=_unique_name(base, used, ip), dtype=dtype,
                        x=CX + RX * math.cos(angle), y=CY + RY * math.sin(angle))
-        iface = M.Interface.from_dict("Eth0", {"ip": ip, "network": f"{ip}/32", "label": d.get("vendor", "") or dtype})
+        remote_iface = _port_name(str((nb or {}).get("remote_port")), 0, set()) if nb else "Eth0"
+        iface = M.Interface.from_dict(remote_iface, {"ip": ip, "network": f"{ip}/32", "label": d.get("vendor", "") or dtype})
         iface.connected_to = f"{router.name} {lan.name}"
         dev.interfaces.append(iface)
         dev.routes.append(M.Route.from_dict({"network": "0.0.0.0/0", "next_hop": target_ip}))
         net.devices[dev.name] = dev
-        lan.connected_to = f"{dev.name} Eth0"
+        lan.connected_to = f"{dev.name} {remote_iface}"
 
     # -- zones ------------------------------------------------------------------
     for d in devices:
@@ -191,9 +238,35 @@ def build_net(scan: dict, protect: set[str] | None = None) -> tuple[M.Net, dict]
 
     net.build_adjacency()
 
+    real_link_count = len(matched)
+    if real_links:
+        proto = next((nb.get("protocol", "lldp") for nb in matched.values() if nb.get("protocol")), "lldp")
+        topology = f"{proto}-discovered"
+    else:
+        topology = "inferred-star"
+
     meta = {
         "subnet": cidr.with_prefixlen,
         "target": target_ip,
         "device_count": len(used),
+        "topology": topology,
+        "wan": "assumed",
+        "links_discovered": real_link_count,
+        "notes": [],
     }
+    if real_links:
+        meta["notes"].append(
+            f"physical links ARE known on the target: {real_link_count} edge(s) grounded in real "
+            "LLDP/CDP neighbor tables (port names from the device, not synthetic)"
+        )
+        net.description = (
+            f"{net.description}. Topology is {topology}: {real_link_count} link(s) "
+            "read from real LLDP/CDP neighbor tables on the target."
+        )
+    else:
+        meta["notes"] += [
+            "physical links are not known to a sweep: devices are modelled on a router-centric star",
+            "the WAN/uplink (203.0.113.0/24, gateway 203.0.113.1) is assumed, not observed",
+        ]
+        net.description = f"{net.description}. Topology is inferred (router-centric star); uplink is assumed."
     return net, meta

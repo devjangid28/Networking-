@@ -1,4 +1,4 @@
-NetProof 0.2.0
+NetProof 0.3.0
 ================
 Neutral network-change validation: propose a change, get a verdict
 (pass / warn / block), a 0-100 trust score, and machine-checkable proof.

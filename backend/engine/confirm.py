@@ -9,7 +9,36 @@ The dashboard surfaces both kinds so an engineer can tell "ground truth" from
 """
 from __future__ import annotations
 
-from .model import Net, Prefix, Route, Rule
+from .model import Net, Prefix, Route, Rule, Filter
+
+
+def merge_configs(base: dict | None, extra: dict) -> dict:
+    """Combine two ``{ip: {filters, routes}}`` config snapshots into ONE dict so
+    config-file (option A) and SSH-pull (option B) feed a single confirmed model.
+    Same-named filters get their rule lists concatenated (base first, then
+    extra); routes are appended in order."""
+    base = base or {}
+    extra = extra or {}
+    out: dict = {}
+    for ip in list(base.keys()) + [k for k in extra.keys() if k not in base]:
+        devs = [d for d in (base.get(ip), extra.get(ip)) if d]
+        by_name: dict = {}
+        order: list = []
+        for dev in devs:
+            for f in dev.get("filters") or []:
+                name = f.get("name")
+                if not name:
+                    continue
+                if name not in by_name:
+                    by_name[name] = {"name": name, "rules": list(f.get("rules") or [])}
+                    order.append(name)
+                else:
+                    by_name[name]["rules"].extend(f.get("rules") or [])
+        routes: list = []
+        for dev in devs:
+            routes.extend(dev.get("routes") or [])
+        out[ip] = {"filters": [by_name[n] for n in order], "routes": routes}
+    return out
 
 
 def _resolve_device(net: Net, key: str):
@@ -95,6 +124,40 @@ def mark_confirmed(net: Net, config: dict | None) -> dict:
                 network = str(r_conf.get("network"))
                 dev.routes.append(Route(network, Prefix.parse(network), str(r_conf.get("next_hop")), source="confirmed"))
                 changes["routes_added"] += 1
+    return changes
+
+
+def ensure_interfaces_filters(dev, name: str) -> None:
+    """Attach a policy point name to every interface of a device that got none."""
+    if not getattr(dev, "interfaces", None):
+        return
+    for iface in dev.interfaces:
+        if name not in (iface.filters or []):
+            iface.filters.append(name)
+
+
+def ingest_config(net: Net, config: dict | None) -> dict:
+    """Mark rules/routes confirmed AND materialize config-only policy points.
+
+    ``mark_confirmed`` only fills policy points the scanner already guessed
+    (the single ``router-lan-in``). A real device usually has many ACLs the
+    scanner never heard of — this adds those as NEW confirmed policy points and
+    attaches them to the router's faces so every rule the device actually has
+    is visible in the dashboard and usable in the Change Builder."""
+    changes = mark_confirmed(net, config)
+    for dev_key, dev_conf in (config or {}).items():
+        dev = _resolve_device(net, str(dev_key))
+        if dev is None:
+            continue
+        for f_conf in dev_conf.get("filters") or []:
+            name = str(f_conf.get("name") or "").strip()
+            if not name or name in net.filters:
+                continue
+            rules = [Rule.from_dict({**r, "source": "confirmed"})
+                     for r in (f_conf.get("rules") or [])]
+            net.filters[name] = Filter(name=name, default="permit", rules=rules)
+            ensure_interfaces_filters(dev, name)
+            changes["rules_added"] += len(rules)
     return changes
 
 

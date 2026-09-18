@@ -88,28 +88,64 @@ def target_to_network(target: str) -> (ipaddress.IPv4Network, str):
 
 
 def local_interfaces() -> list[tuple[str, str]]:
-    """List (ip, prefixlen) of this host's IPv4 interfaces via ipconfig."""
+    """List (ip, prefixlen) of this host's IPv4 interfaces. Cross-platform:
+    Windows uses ipconfig, everything else uses `ip -4 addr` (fallback ifconfig)."""
     pairs: list[tuple[str, str]] = []
-    try:
-        out = subprocess.run(
-            ["ipconfig"], capture_output=True, text=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW
-        ).stdout
-    except Exception:
+    if os.name == "nt":
+        try:
+            out = subprocess.run(
+                ["ipconfig"], capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            ).stdout
+        except Exception:
+            return pairs
+        cur_ip = None
+        for line in out.splitlines():
+            m = re.search(r"IPv4 Address[^:]*:\s*([\d.]+)", line)
+            if m:
+                cur_ip = m.group(1)
+            m = re.search(r"Subnet Mask[^:]*:\s*([\d.]+)", line)
+            if m and cur_ip:
+                mask = m.group(1)
+                plen = 0
+                for octet in mask.split("."):
+                    plen += bin(int(octet)).count("1")
+                pairs.append((cur_ip, plen))
+                cur_ip = None
         return pairs
-    cur_ip = None
-    for line in out.splitlines():
-        m = re.search(r"IPv4 Address[^:]*:\s*([\d.]+)", line)
-        if m:
-            cur_ip = m.group(1)
-        m = re.search(r"Subnet Mask[^:]*:\s*([\d.]+)", line)
-        if m and cur_ip:
-            mask = m.group(1)
-            plen = 0
-            for octet in mask.split("."):
-                plen += bin(int(octet)).count("1")
-            pairs.append((cur_ip, plen))
-            cur_ip = None
+
+    # POSIX: `ip -4 addr show` (modern Linux / recent macOS replaced ifconfig)
+    out = _run_hidden(["ip", "-4", "addr", "show"], timeout=5)
+    if out:
+        ip_now = None
+        for line in out.splitlines():
+            m = re.search(r"inet\s+([\d.]+)/(\d+)", line)
+            if m:
+                pairs.append((m.group(1), int(m.group(2))))
+        if pairs:
+            return pairs
+    # last resort: ifconfig-style
+    out = _run_hidden(["ifconfig", "-a"], timeout=5)
+    for m in re.finditer(r"inet\s+(?:addr:)?([\d.]+).*?(?:netmask\s+(?:0x)?([\da-fA-F]+))?", out, re.DOTALL):
+        raw = m.group(0)
+        am = re.search(r"inet\s+(?:addr:)?([\d.]+)", raw)
+        mm = re.search(r"netmask\s+(?:0x)?([\da-fA-F]+)", raw)
+        if am:
+            plen = 32 - bin(int(mm.group(1), 16)).count("1") if mm and mm.group(1).isdigit() and len(mm.group(1)) == 8 else 24
+            pairs.append((am.group(1), plen))
     return pairs
+
+
+def _fetch(cmd: list[str], timeout: float) -> str:
+    try:
+        res = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        return res.stdout or ""
+    except Exception:
+        return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -135,27 +171,64 @@ def _run_hidden(cmd: list[str], timeout: float = 2.0) -> str:
 
 
 def arp_table() -> dict[str, str]:
-    """ip -> mac from the OS ARP cache."""
-    out = _run_hidden(["arp", "-a"], timeout=5)
-    rows = {}
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) >= 2:
+    """ip -> mac from the OS ARP/neighbor cache. Cross-platform:
+    Windows `arp -a`, Linux `ip neigh`, macOS/BSD `arp -an`."""
+    if os.name == "nt":
+        out = _run_hidden(["arp", "-a"], timeout=5)
+        rows = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    ip = str(ipaddress.ip_address(parts[0]))
+                    mac = parts[1].replace("-", ":")
+                except ValueError:
+                    continue
+                rows[ip] = mac
+    else:
+        rows = {}
+        out = _run_hidden(["ip", "neigh"], timeout=5)
+        if not out:
+            out = _run_hidden(["arp", "-an"], timeout=5)
+        for line in out.splitlines():
+            # Linux: 192.168.1.5 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE
+            m = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}).*?lladdr\s+([0-9a-fA-F:]+)", line)
+            # BSD/macOS: ? (192.168.1.5) at aa:bb:cc:dd:ee:ff on en0 [ethernet]
+            if not m:
+                m = re.search(r"\((\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\)\s+at\s+([0-9a-fA-F:]+)", line)
+            if not m:
+                continue
+            ip, mac = m.group(1), m.group(2)
             try:
-                ip = str(ipaddress.ip_address(parts[0]))
-                mac = parts[1].replace("-", ":")
+                ip = str(ipaddress.ip_address(ip))
             except ValueError:
                 continue
-            if not re.fullmatch(r"[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}", mac):
-                continue
-            if mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
-                continue
-            rows[ip] = mac
-    return rows
+            rows[ip] = mac.replace("-", ":")
+    return {
+        ip: mac.replace("-", ":")
+        for ip, mac in rows.items()
+        if re.fullmatch(r"[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}", mac)
+        and mac not in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff")
+    }
 
 
 def ping_alive(ip: str) -> bool:
-    return _run_hidden(["ping", "-n", "1", "-w", "500", ip], timeout=3).find("TTL=") >= 0
+    if os.name == "nt":
+        return _run_hidden(["ping", "-n", "1", "-w", "500", ip], timeout=3).find("TTL=") >= 0
+    # POSIX: ping -c1 with a short deadline; success == host answered
+    return _run_hidden(["ping", "-c", "1", "-W", "1", ip], timeout=3).find("1 packets received") >= 0 or _alive_by_returncode(ip)
+
+
+def _alive_by_returncode(ip: str) -> bool:
+    try:
+        res = subprocess.run(
+            ["ping", "-c", "1", "-W", "1", ip],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
 
 
 def ping_sweep(net: ipaddress.IPv4Network) -> set[str]:
@@ -191,14 +264,15 @@ def probe_ports_many(items: list[tuple[str, tuple[int, str]]], max_open: int = 8
 
 
 def hostname_of(ip: str) -> str:
-    nb = _run_hidden(["nbtstat", "-A", ip], timeout=2.5)
+    nb = ""
+    if os.name == "nt":
+        nb = _run_hidden(["nbtstat", "-A", ip], timeout=2.5)
+    else:
+        nb = _run_hidden(["nmblookup", "-A", ip], timeout=2.5)
     m = re.search(r"<00>\s+UNIQUE\s+(\S+)", nb)
     if m:
         return m.group(1)
-    try:
-        return socket.gethostbyaddr(ip)[0]
-    except Exception:
-        return ""
+    return _rdns(ip)
 
 
 def _rdns(ip: str) -> str:
@@ -209,7 +283,7 @@ def _rdns(ip: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Minimal SNMPv2c GET (raw UDP)                                             #
+# Minimal SNMPv2c GET + WALK (raw UDP)                                       #
 # --------------------------------------------------------------------------- #
 
 def _snmp_len(n: int) -> bytes:
@@ -370,6 +444,119 @@ def _snmp_walk_varbinds(data: bytes, want: list[str]) -> dict[str, str]:
     return results
 
 
+def _snmp_getnext(host: str, community: str, oid: str, timeout: float = 1.4) -> dict[str, str]:
+    """SNMPv2c GETNEXT for a single OID. Returns {returned_oid: value} or {}."""
+    try:
+        body = (
+            _snmp_tlv(0x02, b"\x01")
+            + _snmp_tlv(0x02, b"\x00")
+            + _snmp_tlv(0x02, b"\x00")
+            + _snmp_tlv(0x30, _snmp_tlv(0x06, _snmp_oid_bytes(oid)) + _snmp_tlv(0x05, b""))
+        )
+        pdu = _snmp_tlv(0xA1, body)
+        msg = (
+            _snmp_tlv(0x02, b"\x01")
+            + _snmp_tlv(0x04, community.encode("ascii", "replace"))
+            + pdu
+        )
+        packet = _snmp_tlv(0x30, msg)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        sock.sendto(packet, (host, 161))
+        data, _ = sock.recvfrom(65535)
+        sock.close()
+    except Exception:
+        return {}
+    return _snmp_walk_varbinds(data, [oid])
+
+
+def snmp_walk(host: str, community: str, root_oid: str, timeout: float = 1.4, max_entries: int = 200) -> dict[str, str]:
+    """SNMPv2c GETNEXT walk of a subtree. Returns {full_oid: value} for every
+    entry under ``root_oid``. Stops when the response OID leaves the subtree
+    or ``max_entries`` is reached."""
+    results: dict[str, str] = {}
+    current = root_oid
+    for _ in range(max_entries):
+        resp = _snmp_getnext(host, community, current, timeout)
+        if not resp:
+            break
+        next_oid, value = next(iter(resp.items()))
+        if not next_oid.startswith(root_oid):
+            break
+        results[next_oid] = value
+        current = next_oid
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# LLDP / CDP neighbor discovery                                              #
+# --------------------------------------------------------------------------- #
+
+def lldp_neighbors(host: str, community: str = "public", timeout: float = 1.4) -> list[dict]:
+    """Walk the LLDP-MIB lldpRemTable and return discovered neighbors.
+
+    Each entry: {local_port, remote_sysname, remote_port}.
+    Walks lldpRemSysName (column 9) and lldpRemPortId (column 7) and merges
+    by the shared index (time_mark.local_port.index).
+    """
+    base = "1.0.8802.1.1.2.1.4.1.1"
+    sysname = snmp_walk(host, community, f"{base}.9", timeout=timeout, max_entries=100)
+    portid = snmp_walk(host, community, f"{base}.7", timeout=timeout, max_entries=100)
+
+    # Parse the index suffix: <time_mark>.<local_port>.<index>
+    entries: dict[str, dict] = {}
+    for oid, val in sysname.items():
+        suffix = oid[len(f"{base}.9."):]
+        parts = suffix.split(".")
+        if len(parts) >= 3:
+            key = parts[1]  # local port number
+            entries.setdefault(key, {"local_port": parts[1], "remote_sysname": val, "remote_port": ""})
+    for oid, val in portid.items():
+        suffix = oid[len(f"{base}.7."):]
+        parts = suffix.split(".")
+        if len(parts) >= 3:
+            key = parts[1]
+            if key in entries:
+                entries[key]["remote_port"] = val
+    return list(entries.values())
+
+
+def cdp_neighbors(host: str, community: str = "public", timeout: float = 1.4) -> list[dict]:
+    """Walk the Cisco CDP cache table and return discovered neighbors.
+
+    Each entry: {local_port, remote_device_id, remote_port, remote_platform}.
+    Index: <ifIndex>.<device_index>. Column OIDs relative to
+    1.3.6.1.4.1.9.9.23.1.2.1.1:  6=deviceId, 7=devicePort, 8=platform.
+    """
+    base = "1.3.6.1.4.1.9.9.23.1.2.1.1"
+    device_id = snmp_walk(host, community, f"{base}.6", timeout=timeout, max_entries=100)
+    dev_port = snmp_walk(host, community, f"{base}.7", timeout=timeout, max_entries=100)
+    platform = snmp_walk(host, community, f"{base}.8", timeout=timeout, max_entries=100)
+
+    entries: dict[str, dict] = {}
+    for oid, val in device_id.items():
+        suffix = oid[len(f"{base}.6."):]
+        parts = suffix.split(".")
+        if len(parts) >= 2:
+            key = ".".join(parts[:2])
+            entries.setdefault(key, {"local_port": parts[0], "remote_device_id": val, "remote_port": "", "remote_platform": ""})
+    for oid, val in dev_port.items():
+        suffix = oid[len(f"{base}.7."):]
+        parts = suffix.split(".")
+        if len(parts) >= 2:
+            key = ".".join(parts[:2])
+            if key in entries:
+                entries[key]["remote_port"] = val
+    for oid, val in platform.items():
+        suffix = oid[len(f"{base}.8."):]
+        parts = suffix.split(".")
+        if len(parts) >= 2:
+            key = ".".join(parts[:2])
+            if key in entries:
+                entries[key]["remote_platform"] = val
+    return list(entries.values())
+
+
 def _snmp_probe(sysdescr: str) -> dict:
     """Extract useful facts from an SNMP sysDescr string."""
     d = sysdescr.lower()
@@ -475,7 +662,7 @@ def scan(target: str, community: str = "public", do_ping: bool = True, max_devic
         swept = ping_sweep(net)
         alive |= swept
         if not swept:
-            result["notes"].append("ping sweep returned nothing (ICMP may be blocked by Windows Defender Firewall)")
+            result["notes"].append("ping sweep returned nothing (ICMP may be blocked by the local firewall)")
 
     try:
         if ipaddress.ip_address(target_ip) not in net:
@@ -537,6 +724,19 @@ def scan(target: str, community: str = "public", do_ping: bool = True, max_devic
     if snmp and not community.strip():
         result["notes"].append("SNMP probe skipped (no community given)")
 
+    # -- LLDP / CDP neighbor discovery on the target ---------------------------
+    neighbors: list[dict] = []
+    if community and snmp:
+        target_snmp = snmp.get(target_ip, {})
+        lldp = lldp_neighbors(target_ip, community)
+        if lldp:
+            neighbors.extend({"protocol": "lldp", **n} for n in lldp)
+            result["notes"].append(f"LLDP: discovered {len(lldp)} neighbor(s) on {target_ip}")
+        cdp = cdp_neighbors(target_ip, community)
+        if cdp:
+            neighbors.extend({"protocol": "cdp", **n} for n in cdp)
+            result["notes"].append(f"CDP: discovered {len(cdp)} neighbor(s) on {target_ip}")
+
     for ip in sorted(work, key=lambda x: ipaddress.ip_address(x)):
         mac = arp.get(ip, "")
         services = probes.get(ip, [])
@@ -564,4 +764,6 @@ def scan(target: str, community: str = "public", do_ping: bool = True, max_devic
                 "sysLocation": snmp_basic.get(".1.3.6.1.2.1.1.6.0", ""),
             },
         })
+    if neighbors:
+        result["neighbors"] = neighbors
     return result

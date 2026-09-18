@@ -173,6 +173,7 @@ filters:
     rules: []
 
   - name: fw-inside-in
+    stateful: true
     default: deny
     rules:
       - action: permit
@@ -197,6 +198,7 @@ filters:
         dport: 443
 
   - name: fw-outside-in
+    stateful: true
     default: deny
     rules:
       - action: permit

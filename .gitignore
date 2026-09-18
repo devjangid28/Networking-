@@ -20,3 +20,7 @@ backend/data/*.db*
 backend/*.db*
 backend/tenants.db
 backend/data/tenants.db
+
+# Local deployment secrets (Docker compose)
+.env
+.env.local
