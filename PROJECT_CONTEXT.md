@@ -236,7 +236,9 @@ Phases are approximate and overlap.
 - `backend/mcp_server.py`: a Model Context Protocol server (official `mcp`
   Python SDK; stdio by default, or Streamable HTTP on 127.0.0.1:8100) so AI
   agents get the referee natively: `validate_change`, `get_verdict`,
-  `list_network_inventory`, `parse_intent`, `get_guardrails`, `list_presets`.
+  `list_network_inventory`, `parse_intent`, `get_guardrails`, `list_presets`,
+  `describe_target` (the same per-device intelligence bundle as the REST
+  endpoint).
   Model paths confined to `backend/data` (no arbitrary file reads).
 - `DEPLOY.md`, `README.md`, `.env.example` written up: dev, Docker, the TLS
   profile, hardening checklist, RBAC and agent usage.
@@ -318,6 +320,10 @@ netproof/
       guardrails.py         # per-org data-driven pre-flight policy (YAML rules)
       audit.py              # verdicts table + snapshot/hash/fingerprint + replay +
                             #   unified diff + canonical snapshot
+      intel.py              # target-intelligence bundle: per-device identity,
+                            #   discovery detail, confirmed-vs-inferred, applicable
+                            #   org guardrails w/ evidence, validation history,
+                            #   suggested actions
       events.py             # append-only audit-event log
       tenant.py             # orgs, API-key digests, org users, agent reports
     data/
@@ -373,6 +379,14 @@ netproof/
   `POST /api/verdicts/{vid}/replay` (determinism proof),
   `GET /api/verdicts/{vid}/export` (JSON artifact), `GET /api/verdicts/{vid}/diff`.
 - `GET  /api/audit` — admin-only event log.
+- `GET  /api/target/{ip}/intelligence` — per-device target dossier scoped to the
+  active model window (demo / scan / agent): identity + discovery detail,
+  confirmed-vs-inferred counts, the applicable org guardrails with their
+  evidence, validation history (past verdicts touching this address), and
+  evidence-based suggested actions. `GET /api/target/{ip}/intelligence/export`
+  returns the same bundle as an attachment JSON artifact. Session scoping
+  mirrors `/api/model` (scan → session, agent → org scope or session, demo →
+  open).
 
 Environment variables (`NETPROOF_*`): `ADMIN_PASS` (required), `ADMIN_USER`,
 `DB`, `ORG_DIR`, `ALLOWED_ORIGINS` (CORS), `DOMAIN` (TLS/HSTS), `ALLOW_HTTP`
@@ -474,25 +488,32 @@ role-aware UI in the top bar.
 - **Device-inspect drawer** — clicking a device (`renderDetail`) opens the
   right-hand drawer (`#dev-detail`) with identity, interfaces, routes, filters
   and policy entries; confirmed vs inferred entries carry distinct badges
-  (`srcBadge`), and source/destination fields reuse the glossary tooltips.
+  (`srcBadge`), and source/destination fields reuse the glossary tooltips. A
+  second **Intelligence** tab (`loadIntelligence`/`renderIntelligence`) fetches
+  `/api/target/{ip}/intelligence` for the active model window and renders the
+  dossier: identity, SNMP/services/neighbors, confirmed-vs-inferred counts,
+  applicable guardrails with evidence, validation history (rows deep-link back
+  into the verdict view), and suggested actions.
 
 Verification: on 2026-09-18 the real `index.html` + `app.js` (fetched from a
-running server) were executed in a jsdom harness against the live backend — 27
+running server) were executed in a jsdom harness against the live backend — 36
 behavioral assertions passed (hover tooltip, mode toggle both ways, walkthrough
-open/dismiss/re-open, risk dialog yes/cancel/escape, direct function calls).
+open/dismiss/re-open, risk dialog yes/cancel/escape, direct function calls, and
+the device-inspect Intelligence tab rendering a real bundle from
+`/api/target/{ip}/intelligence`).
 
 ---
 
 ## 11. Testing
 
-16 test files under `backend/tests/` covering: agent config, agent HTTPS
-policy, consent gate, discovery, end-to-end, filter semantics,
-MCP tools, metrics, config pull, rate limits, RBAC/tenant isolation, scan
-config, snapshots, stateful firewalls, TLS/HSTS, plus `test_new.py` (manual
-backward-compat + agent endpoint checks, verifies "All 13 engine presets";
-sets `NETPROOF_ADMIN_PASS=admin-test-pass-2026`) and `test_stateful.py`.
-`conftest.py` provides shared fixtures. `debug_agent.py` is a scratch/diagnostic
-script for exercising the agent-report path outside pytest.
+17 test files under `backend/tests/` covering: agent config, agent HTTPS
+policy, consent gate, discovery, end-to-end, filter semantics, target
+intelligence, MCP tools, metrics, config pull, rate limits, RBAC/tenant
+isolation, scan config, snapshots, stateful firewalls, TLS/HSTS, plus
+`test_new.py` (manual backward-compat + agent endpoint checks, verifies "All 13
+engine presets"; sets `NETPROOF_ADMIN_PASS=admin-test-pass-2026`) and
+`test_stateful.py`. `conftest.py` provides shared fixtures. `debug_agent.py` is
+a scratch/diagnostic script for exercising the agent-report path outside pytest.
 
 ---
 
@@ -524,7 +545,9 @@ metrics, TLS deployment, MCP interface.
 Obvious next candidates (not yet built):
 - Batfish-class features at depth (e.g. realistic firewall/NAT interaction
   beyond the current scoping).
-- YAML/JSON export of a full validation "proof bundle" for external audit.
+- Full **validation** "proof bundle" JSON export for external audit (partial
+  delivery exists: the target-intelligence bundle + per-verdict `/export`
+  serve this cut).
 - More router dialects / vendors in `parse_router_text`.
 - Automated CI (git repo initialized 2026-09-18; no CI added yet) and
   packaging (PyPI / OCI).
@@ -538,6 +561,20 @@ frontend/architecture split; then propose the single highest-value next feature.
 
 ## 14. Changelog (updated after every change)
 
+- **2026-09-18** — **Target Intelligence Bundle (S3).** New
+  `backend/engine/intel.py` (`target_intelligence`) + `audit.list_verdicts_for_target`
+  assemble a per-device dossier: identity (with its source), discovery detail
+  (SNMP/services/neighbors/interfaces/links), confirmed-vs-inferred counts, the
+  org guardrails that fire on THIS device with their evidence, validation
+  history (org-scoped in agent mode for tenant isolation), and evidence-based
+  suggested actions. New REST: `GET /api/target/{ip}/intelligence` +
+  `/export` (auth mirrors `/api/model`). New MCP tool `describe_target(ip)`.
+  Frontend: the device-inspect drawer gained an **Intelligence** tab
+  (`renderIntelligence` in `web/app.js` + new `web/styles.css` block) that
+  renders the bundle and deep-links history rows into the verdict view. Tests:
+  `backend/tests/test_intel.py` (10) + `test_mcp.describe_target`, live-verified
+  in the jsdom harness (36/36 assertions, incl. 9 intel-tab checks). Full suite:
+  130 pass. Sections 5/6/11/13 refreshed.
 - **2026-09-18** — Context-doc reconciliation session: initialized the git repo
   in `netproof/` and committed `PROJECT_CONTEXT.md` (baseline `c01ee31`);
   verified all frontend UX affordances (glossary tooltips, simple/expert view,

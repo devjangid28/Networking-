@@ -56,6 +56,7 @@ from engine.confirm import counts as confirm_counts, ingest_config, merge_config
 from engine.discover import scan as run_scan
 from engine.guardrails import check_change, guardrail_blocked, load_guardrails
 from engine.intent import parse_intent
+from engine.intel import target_intelligence
 from engine.model import load_net, Net
 from engine.events import init_events, log_event, list_events
 from engine.reach import apply_change
@@ -934,6 +935,70 @@ def model_info(mode: str = "demo", org: str = "", protect: str = "", request: Re
         info["confirmations"] = confirm_counts(entry["net"])
         info["config_sources"] = entry.get("config_sources") or []
     return info
+
+
+def _intel_bundle(ip: str, mode: str, org: str, request: Request) -> dict:
+    """Assemble the target-intelligence bundle for `ip`, scoped to the same
+    model window the dashboard is showing (active scan / agent report / demo).
+    Session scope mirrors /api/model: scans and agent reports are attributable
+    actions, an agent account requires org scope, the demo baseline is public."""
+    if mode == "agent":
+        if org:
+            _require_org_scope(request, org)
+        else:
+            require_session(request)
+    elif mode == "scan":
+        require_session(request)
+    scan = None
+    scope: dict = {"mode": mode, "org": org or "default"}
+    if mode == "scan":
+        with _SCAN_LOCK:
+            if _SCAN_NET is None:
+                raise HTTPException(status_code=400, detail="No live scan yet - run a scan from the 'Scan a network' panel first.")
+            net = _SCAN_NET
+            scan = _SCAN_RESULT or {}
+            scope.update({
+                "subnet": scan.get("network"),
+                "scan_target": scan.get("target"),
+                "at": datetime.datetime.fromtimestamp(_SCAN_AT).isoformat() if _SCAN_AT else None,
+                "config_sources": list(_SCAN_CONFIG_SOURCES),
+            })
+    elif mode == "agent":
+        entry = _agent_net(org)
+        if entry is None:
+            raise HTTPException(status_code=400, detail="No agent report yet for this account.")
+        net = entry["net"]
+        scan = entry["scan"] or {}
+        scope.update({
+            "subnet": scan.get("network"),
+            "scan_target": scan.get("target"),
+            "at": entry["at"],
+            "config_sources": entry.get("config_sources") or [],
+        })
+    else:
+        net = NET
+        scope["model"] = str(NET_PATH)
+    return target_intelligence(ip, net, scan=scan, scope=scope, org=org or "default")
+
+
+@app.get("/api/target/{ip}/intelligence")
+def target_intelligence_endpoint(ip: str, mode: str = "demo", org: str = "", request: Request = None) -> dict:
+    """A per-device dossier: identity, discovery detail, confirmed-vs-inferred,
+    the guardrails that would fire on THIS device, past validations touching it,
+    and evidence-based suggested actions. Scoped to the active model window."""
+    return _intel_bundle(ip, mode, org, request)
+
+
+@app.get("/api/target/{ip}/intelligence/export")
+def target_intelligence_export(ip: str, mode: str = "demo", org: str = "", request: Request = None):
+    """Machine-readable JSON export of the target-intelligence bundle
+    (consistent with the verdict export surface)."""
+    bundle = _intel_bundle(ip, mode, org, request)
+    fname = f"netproof-intel-{ip}.json"
+    return JSONResponse(
+        content=bundle,
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 @app.post("/api/validate")

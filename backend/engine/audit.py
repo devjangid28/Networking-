@@ -237,6 +237,31 @@ def list_verdicts(limit: int = 20, db: str = DEFAULT_DB, org_id: str | None = No
     return [_row_to_dict(r) for r in rows]
 
 
+def list_verdicts_for_target(needle: str, limit: int = 20, db: str = DEFAULT_DB, org_id: str | None = None) -> list[dict]:
+    """Verdicts whose raw_change text mentions `needle` (an IP, device name or
+    zone). Used by the target-intelligence bundle to summarise every past
+    validation that touched a given device."""
+    with _lock:
+        q = (
+            "SELECT id, created_at, model_name, engine_version, requester, org_id, "
+            "change_fingerprint, raw_change, verdict_final, trust_score, guardrails "
+            "FROM verdicts WHERE raw_change LIKE ?"
+        )
+        args: list = [f"%{needle}%"]
+        if org_id:
+            q += " AND org_id = ?"
+            args.append(org_id)
+        q += " ORDER BY created_at DESC LIMIT ?"
+        args.append(int(limit))
+        rows = _conn(db).execute(q, args).fetchall()
+    out = []
+    for r in rows:
+        d = _row_to_dict(r)
+        d["change"] = d.pop("raw_change", {}) or {}
+        out.append(d)
+    return out
+
+
 def _row_to_dict(row) -> dict:
     d = dict(row)
     d.pop("model_snapshot", None)

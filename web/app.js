@@ -814,6 +814,7 @@ function renderDetail(dev, raw) {
     }
   }
 
+  const ip = mainIp(dev);
   panel.innerHTML = `
     <div class="dd-head">
       <div class="dd-icon" style="color:${color}">${icon}</div>
@@ -823,15 +824,125 @@ function renderDetail(dev, raw) {
       </div>
       <button class="dd-close" id="dd-close" title="Close">×</button>
     </div>
+    <div class="dd-tabs">
+      <button type="button" class="dd-tab active" data-tab="overview">Overview</button>
+      <button type="button" class="dd-tab" data-tab="intel">Intelligence</button>
+    </div>
     <div class="dd-body">
-      ${kv("IP", mainIp(dev), true)}
+      ${kv("IP", ip, true)}
       ${ifaces ? `<div class="dk-sec">interfaces</div>` + ifaces : ""}
       ${routes ? `<div class="dk-sec">routes</div>` + routes : ""}
       ${policy}
       ${ext}
-    </div>`;
+    </div>
+    <div class="dd-body" id="dd-intel" hidden></div>`;
   panel.querySelector("#dd-close").addEventListener("click", hideDeviceDetail);
+  panel.querySelectorAll(".dd-tab").forEach((t) => t.addEventListener("click", () => {
+    panel.querySelectorAll(".dd-tab").forEach((x) => x.classList.toggle("active", x === t));
+    const showIntel = t.dataset.tab === "intel";
+    panel.querySelector(".dd-body").hidden = showIntel;
+    panel.querySelector("#dd-intel").hidden = !showIntel;
+    if (showIntel) loadIntelligence(panel, ip);
+  }));
   panel.hidden = false;
+}
+
+/* ---------------- target intelligence (device-inspect tab) ---------------- */
+async function loadIntelligence(panel, ip) {
+  const el = panel.querySelector("#dd-intel");
+  el.innerHTML = `<div class="dk-row"><span>loading</span><b>assembling target intelligence…</b></div>`;
+  try {
+    const q = new URLSearchParams({ mode: MODE, org: MODE === "agent" ? (ACTIVE_ORG || "default") : "" }).toString();
+    const res = await fetch(`/api/target/${encodeURIComponent(ip)}/intelligence?${q}`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || res.statusText);
+    }
+    el.innerHTML = renderIntelligence(await res.json());
+    el.querySelectorAll("[data-vid]").forEach((btn) => btn.addEventListener("click", async () => {
+      try {
+        const stored = await (await fetch(btn.dataset.vid)).json();
+        const rep = stored && stored.report ? (typeof stored.report === "string" ? JSON.parse(stored.report) : stored.report) : null;
+        if (rep) { renderResult(rep); toast("Opened verdict " + btn.dataset.vid.split("/").pop()); }
+        else toast("Verdict has no replayable report", true);
+      } catch (e) { toast("Failed to open verdict: " + e.message, true); }
+    }));
+  } catch (e) {
+    el.innerHTML = `<div class="dk-row"><span>error</span><b>${esc(e.message)}</b></div>`;
+  }
+}
+
+function renderIntelligence(b) {
+  const id = b.identity || {};
+  const disc = b.discovery_detail || {};
+  const cvi = b.confirmed_vs_inferred || {};
+  const src = b.scope || {};
+  const rules = cvi.rules || {}, routes = cvi.routes || {};
+  let html = "";
+
+  html += `<div class="dk-row"><span>scope</span><b>${esc(src.mode || "demo")}${b.status === "not_in_scope" ? " · not in scope" : ""}</b></div>`;
+  if (src.at) html += kv("reported", src.at);
+
+  html += `<div class="dk-sec">identity</div>`;
+  html += kv("hostname", id.hostname, true);
+  html += kv("mac", id.mac, true);
+  html += kv("vendor", id.vendor);
+  html += kv("type", id.type_guess || id.device_type);
+  html += `<div class="dk-row"><span>source</span><b>${esc(id.identity_source || "none")}</b></div>`;
+
+  html += `<div class="dk-sec">confirmed vs inferred</div>`;
+  html += `<div class="conf-line">` +
+    `<span class="conf-count">${rules.confirmed}<i> confirmed rules</i></span>` +
+    `<span class="conf-count">${rules.inferred}<i> inferred rules</i></span>` +
+    `<span class="conf-count">${routes.confirmed}<i> confirmed routes</i></span>` +
+    `<span class="conf-count">${routes.inferred}<i> inferred routes</i></span></div>`;
+  (cvi.entries || []).slice(0, 8).forEach((e) => {
+    html += `<div class="pol-rule"><span class="intel-kind">${esc(e.kind === "rule" ? e.filter || "rule" : e.kind)}</span><span class="pol-spec">${esc(e.label)}</span>${srcBadge(e.source)}</div>`;
+  });
+
+  if (disc.snmp) {
+    html += `<div class="dk-sec">snmp</div>`;
+    html += kv("sysName", disc.snmp.sysName, true) + kv("sysDescr", disc.snmp.sysDescr, true);
+  }
+  if (disc.services && disc.services.length) {
+    html += `<div class="dk-sec">open services</div><div class="dk-chips">` +
+      disc.services.map((s) => `<span class="srv-chip">${esc(s.port)}/<b>${esc(s.service)}</b></span>`).join("") + `</div>`;
+  }
+  if (disc.neighbors && disc.neighbors.length) {
+    html += `<div class="dk-sec">neighbors (lldp/cdp)</div>` +
+      disc.neighbors.slice(0, 6).map((n) =>
+        kv(n.protocol + " → " + (n.remote_sysname || n.remote_device_id || "?"), (n.local_port || "?") + " ↔ " + (n.remote_port || "?"), true)
+      ).join("");
+  }
+
+  const guards = b.applicable_guardrails || [];
+  html += `<div class="dk-sec">applicable guardrails <span class="dim">${guards.length}</span></div>`;
+  if (!guards.length) html += `<div class="dk-row"><span>none</span><b>no org guardrail targets this device's features</b></div>`;
+  guards.forEach((r) => {
+    html += `<div class="gr-row"><span class="gr-sev ${esc(r.severity)}">${esc(r.severity)}</span><span class="gr-title">${esc(r.title)}</span></div>`;
+    if (r.relevance) html += `<div class="gr-rel">${esc(r.relevance)}</div>`;
+  });
+
+  const hist = b.validation_history || [];
+  html += `<div class="dk-sec">validation history <span class="dim">${hist.length}</span></div>`;
+  if (!hist.length) html += `<div class="dk-row"><span>none</span><b>no past verdicts mention this device</b></div>`;
+  hist.slice(0, 6).forEach((v) => {
+    const ct = v.change && v.change.type ? v.change.type : "?";
+    html += `<div class="vh-row"><span class="gr-sev ${esc(v.verdict)}">${esc(v.verdict)}</span>` +
+      `<span class="vh-chg">${esc(ct)}</span>` +
+      `<span class="vh-score">${v.trust_score != null ? v.trust_score + "/100" : ""}</span>` +
+      `<button type="button" class="vh-link" data-vid="${esc(v.link)}" title="${esc(v.created_at || "")}">open</button></div>`;
+  });
+
+  const acts = b.suggested_actions || [];
+  html += `<div class="dk-sec">suggested actions</div>`;
+  if (!acts.length) html += `<div class="dk-row"><span>none</span><b>nothing to flag for this target</b></div>`;
+  acts.forEach((s) => {
+    html += `<div class="gr-row"><span class="gr-sev ${esc(s.severity)}">${esc(s.action)}</span><span class="gr-title">${esc(s.why)}</span></div>`;
+    if (s.note) html += `<div class="gr-rel">${esc(s.note)}</div>`;
+  });
+
+  return html;
 }
 
 function showDeviceDetail(name) {

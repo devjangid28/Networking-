@@ -698,6 +698,27 @@ table.matrix td.cell { text-align: center; min-width: 86px; }
 .dk-sec { margin-top: 8px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--faint); border-top: 1px solid var(--border-soft); padding-top: 8px; }
 .dk-chips { display: flex; flex-wrap: wrap; gap: 4px; }
 
+/* ---- device-inspect drawer: tabs + target intelligence ---- */
+.dd-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+.dd-tab { background: var(--panel-3); border: 1px solid var(--border-soft); color: var(--dim); border-radius: 7px; padding: 4px 12px; font-size: 11.5px; font-weight: 600; cursor: pointer; }
+.dd-tab.active { color: var(--text); border-color: rgba(94, 129, 244, 0.55); background: rgba(94, 129, 244, 0.13); }
+.conf-line { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.intel-kind { font-family: var(--mono); font-size: 9px; color: var(--faint); text-transform: uppercase; flex: none; }
+.gr-row { display: flex; align-items: baseline; gap: 7px; margin-top: 5px; }
+.gr-sev { flex: none; font-family: var(--mono); font-size: 9.5px; font-weight: 700; text-transform: uppercase; padding: 1px 6px; border-radius: 5px; letter-spacing: 0.03em; }
+.gr-sev.critical, .gr-sev.block { color: var(--danger); background: rgba(217, 123, 111, 0.14); }
+.gr-sev.warning, .gr-sev.warn { color: var(--warn); background: rgba(217, 165, 92, 0.14); }
+.gr-sev.pass { color: var(--pass); background: rgba(76, 183, 130, 0.14); }
+.gr-sev.info, .gr-sev.review { color: var(--info); background: rgba(94, 129, 244, 0.14); }
+.gr-title { font-size: 12px; color: var(--text); }
+.gr-rel { font-size: 11px; color: var(--dim); margin: 2px 0 4px 24px; line-height: 1.45; }
+.vh-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 11.5px; }
+.vh-chg { color: var(--text); font-family: var(--mono); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vh-score { color: var(--faint); font-family: var(--mono); font-size: 10.5px; }
+.vh-link { background: none; border: 1px solid var(--border-soft); color: var(--accent); border-radius: 5px; padding: 1px 8px; font-size: 10.5px; cursor: pointer; }
+.vh-link:hover { background: rgba(94, 129, 244, 0.13); }
+#dd-intel .dk-row, #dd-intel .pol-rule { padding: 2px 0; }
+
 @media (max-width: 1180px) {
   .shell { flex-direction: column; padding: 18px 18px 50px; gap: 18px; }
   .sidebar { width: 100%; position: static; flex-direction: row; flex-wrap: wrap; gap: 12px; align-items: flex-end; }

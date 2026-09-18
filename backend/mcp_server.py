@@ -12,6 +12,8 @@ Tools:
     parse_intent            - plain-English -> IR change (+ confirmation)
     get_guardrails          - per-org pre-flight policy check
     list_presets            - example change schema
+    describe_target         - per-device intelligence bundle (identity, discovery,
+                              confirmed/inferred, applicable guardrails, history, actions)
 
 Every tool is read-only against the real network: the baseline model is
 deep-copied for validation and the result is persisted to the audit DB.
@@ -28,6 +30,7 @@ if str(BACKEND) not in sys.path:
 from engine.audit import get_verdict as _get_verdict, save_verdict  # noqa: E402
 from engine.guardrails import check_change, guardrail_blocked, load_guardrails  # noqa: E402
 from engine.intent import parse_intent as _parse_intent  # noqa: E402
+from engine.intel import target_intelligence  # noqa: E402
 from engine.model import load_net, Net  # noqa: E402
 from engine.validate import ALL_PRESETS, ENGINE_VERSION  # noqa: E402
 from engine import validate as _validate  # noqa: E402
@@ -245,6 +248,20 @@ def _run() -> "FastMCP":
         """List the example change presets bundled with NetProof (learn the change schema,
         including the BGP / OSPF / DNS / VLAN change language)."""
         return {"presets": ALL_PRESETS}
+
+    @mcp.tool()
+    def describe_target(ip: str, model: str = "", org: str = "default") -> dict:
+        """Build the target-intelligence bundle for one IP address (or device): who/what
+        the device is, how its facts were discovered, which facts are CONFIRMED vs
+        INFERRED, the org guardrails that would fire on a change to THIS device, every
+        past verdict that touched it, and evidence-based suggested next steps. Read-only:
+        it only assembles data already in the model, the scan context and the audit trail."""
+        net = _net_for({"model": model})
+        return target_intelligence(
+            ip, net,
+            scope={"mode": "mcp", "model": model or str(_model_dir() / "acme_office.yaml")},
+            org=org or "default",
+        )
 
     return mcp
 
