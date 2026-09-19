@@ -44,6 +44,7 @@ from security import (
 )
 import security_headers as security_headers_mod
 import csrf
+import limits
 from engine.audit import (
     change_fingerprint,
     get_snapshot,
@@ -79,6 +80,12 @@ NET_PATH = BASE / "data" / "acme_office.yaml"
 WEB_DIR = BASE.parent / "web"
 
 app = FastAPI(title="NetProof", description="Neutral network-change validation", version=ENGINE_VERSION)
+
+# Phase A5: innermost ASGI guard that counts real bytes on state-changing
+# requests (chunked / unannounced bodies). Registered first so it wraps the
+# router directly; the Content-Length pre-check below runs inside the
+# security-header layer so its 413 keeps the strict headers.
+app.add_middleware(limits.BodySizeLimitMiddleware)
 
 # CORS: same-origin by default. Adding a foreign origin requires the operator
 # to opt in explicitly via $NETPROOF_ALLOWED_ORIGINS (comma-separated).
@@ -157,6 +164,13 @@ async def enforce_https(request: Request, call_next):
 @app.middleware("http")
 async def csrf_guard(request: Request, call_next):
     return await csrf.csrf_middleware(request, call_next)
+
+
+# Phase A5: global request-body size bound. Declared under security_headers so
+# its 413 responses still carry the strict headers + request id.
+@app.middleware("http")
+async def body_size_guard(request: Request, call_next):
+    return await limits.body_size_middleware(request, call_next)
 
 
 # Phase A4: strict default security headers + request correlation id. Declared

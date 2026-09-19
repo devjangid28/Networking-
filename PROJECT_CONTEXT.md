@@ -469,6 +469,11 @@ Environment variables (`NETPROOF_*`): `ADMIN_PASS` (required), `ADMIN_USER`,
   requests pass; `/api/login` exempt; `NETPROOF_ALLOWED_ORIGINS` allowlisted.
 - Rate limiting per client IP; proxy headers trusted only when explicitly
   configured (`NETPROOF_DOMAIN` / `NETPROOF_TRUST_PROXY`).
+- Global request-body bound (A5): `NETPROOF_MAX_BODY_BYTES` (default 8 MiB)
+  caps state-changing bodies via a `Content-Length` pre-check plus an innermost
+  stream guard, so declared *and* chunked/oversized bodies never commit memory
+  past the cap (413 with the strict headers); engine's tighter per-artefact caps
+  unchanged.
 - Agent HTTPS enforcement; loopback HTTP allowed for dev/testing, everything
   else requires HTTPS unless `NETPROOF_ALLOW_HTTP=1`.
 - Terminal TLS enforcement behind Caddy (307/HSTS) when `NETPROOF_DOMAIN` set.
@@ -624,9 +629,16 @@ a scratch/diagnostic script for exercising the agent-report path outside pytest.
 - New A4 security-header tests `backend/tests/test_security_headers.py` (8) —
   headers on every API + static route, strict CSP, request-id echo/rotation, CSP
   operator extension, TLS-bump headers.
-- Full gate green on 2026-09-19: pytest **215 passed**, harness **40/40**
-  (incl. the six new security-header/request-id assertions), presets **13/13**,
-  `pip-audit -r requirements.txt` **0 vulnerabilities**.
+- New A3 CSRF tests `backend/tests/test_csrf.py` (10) — cross-site
+  Origin/Referer/`null` → 403, cookie-less and headerless non-browser requests
+  pass, login exempt, allowlist honoured, GET/health untouched, 403 carries the
+  strict headers.
+- New A5 body-size tests `backend/tests/test_limits.py` (9) — under/at/over the
+  boundary (computed against httpx's compact wire serialisation), chunked body
+  without Content-Length streamed and capped, GET unaffected, env override and
+  documented default, 413 keeps the security headers.
+- Full gate green on 2026-09-19: pytest **242 passed**, harness **40/40**,
+  presets **13/13**, `pip-audit -r requirements.txt` **0 vulnerabilities**.
 
 ---
 
@@ -653,11 +665,12 @@ validation, intent + guardrails, multi-tenant agent model, audit/replay,
 **evidence-aware post-change verification**, metrics, TLS deployment, MCP interface.
 
 **Production-readiness roadmap (Phases A–H) in progress — status:**
-- Phase A (release/security gate): A0–A1–A3–A4 COMPLETE; A2/A5/A6 NOT STARTED.
-- A1: CI + release-checks gate green (233 pytest / 13 presets / 40 harness / ruff+mypy new-code / pip-audit clean / secret scan).
+- Phase A (release/security gate): A0–A1–A3–A4–A5 COMPLETE; A2/A6 NOT STARTED.
+- A1: CI + release-checks gate green (242 pytest / 13 presets / 40 harness / ruff+mypy new-code / pip-audit clean / secret scan).
 - A4: strict default security headers + request-id COMPLETE; harness 6/6 new assertions green.
+- A5: global request-body size bound COMPLETE (`backend/limits.py` + 9 tests) — body memory capped at `NETPROOF_MAX_BODY_BYTES` on state-changing requests.
 - Local Docker verified run remains BLOCKED BY ENVIRONMENT (no Docker binary); ubuntu CI carries the Docker gate.
-- Backlog: legacy ruff/mypy debt (Phase C), A2/A3/A5/A6, Phases B–H.
+- Backlog: legacy ruff/mypy debt (Phase C), A2/A6, Phases B–H.
 
 **Bug-status reconciliation (2026-09-18, verified against the current code):**
 - *"`intent.py` has an `or True` bug"* — **not present.** `grep` for `or True` /
@@ -682,6 +695,16 @@ frontend/architecture split; then propose the single highest-value next feature.
 
 ## 14. Changelog (updated after every change)
 
+- **2026-09-19 — Phase A: global request-body size bound (A5).** New
+  `backend/limits.py`: `NETPROOF_MAX_BODY_BYTES` (default 8 MiB) enforced two
+  ways — a `Content-Length` pre-check inside the security-header layer
+  (413 carries CSP/nosniff/request-id) and an innermost ASGI guard that counts
+  real bytes on state-changing requests (chunked/unannounced bodies are never
+  buffered past the cap; FastAPI's swallowed body-read 400 is rewritten to 413
+  via the guard's `send` wrapper). `backend/tests/test_limits.py` (9):
+  under/at/over boundary, chunked overflow, env override + default documented,
+  GETs unaffected, 413 carries headers. Engine per-artefact caps (2 MiB/64 docs)
+  unchanged.
 - **2026-09-19 — Phase A: CSRF origin enforcement (A3).** New `backend/csrf.py`
   + an HTTP middleware (runs under the security-header middleware so its 403s
   still carry CSP/nosniff/request-id): cookie-authenticated POST/PUT/PATCH/DELETE

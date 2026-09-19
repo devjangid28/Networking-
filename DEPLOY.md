@@ -80,7 +80,9 @@ Windows users: `.\run.ps1` (uses `lib\venv`, created by `.\bootstrap.ps1`).
 | `NETPROOF_ADMIN_USER` | `admin` | Dashboard admin username. |
 | `NETPROOF_DB` | `backend/data/netproof.db` | Path to the SQLite database (verdicts, sessions, tenants, audit events). |
 | `NETPROOF_ORG_DIR` | `backend/data/orgs` | Per-org guardrail YAML directory. |
-| `NETPROOF_ALLOWED_ORIGINS` | (empty) | Comma-separated CORS allow-list; empty = same-origin only. |
+| `NETPROOF_ALLOWED_ORIGINS` | (empty) | Comma-separated CORS allow-list; empty = same-origin only. Also envelopes the CSRF origin allow-list (A3). |
+| `NETPROOF_MAX_BODY_BYTES` | `8388608` (8 MiB) | Global request-body cap (content-length pre-check + streaming guard); 413 on oversized bodies (A5). |
+| `NETPROOF_CSP_SRC` | (empty) | Extra CSP directives appended to the shipped policy, e.g. `connect-src https://grafana.internal` (A4). |
 | `NETPROOF_HOST` / `NETPROOF_PORT` | `127.0.0.1` / `8000` | Bind address / port (`run.sh`). In Docker the app binds `0.0.0.0` (internal only). |
 | `NETPROOF_DOMAIN` | *(empty)* | Public hostname. Set it + `docker compose --profile production up -d` to enable the Caddy TLS reverse proxy (Let's Encrypt).
 
