@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: backend (Python 3.12) — ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node for the jsdom harness
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/harness/package-lock.json
+
+      - name: Install backend dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Install harness dependencies
+        run: npm ci
+        working-directory: web/harness
+
+      - name: Full CI gate (compile, imports, pytest, server boot, 13 presets, jsdom harness)
+        run: python scripts/ci.py
+
+  static:
+    name: static checks (lint/type/deps/docker/secrets) — ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check backend agent scripts
+
+      - name: Type check (mypy) — backend/engine
+        run: mypy backend/engine
+
+      - name: Dependency vulnerability scan (pip-audit)
+        run: pip-audit -r requirements.txt
+
+      - name: Secret scan
+        run: python scripts/secret_scan.py
+
+      - name: Validate docker-compose configuration
+        run: docker compose config -q
+
+      - name: Build the container image
+        run: docker build -t netproof:ci .
+
+      - name: Container smoke (health + /health)
+        run: |
+          docker run -d --name np-ci -e NETPROOF_ADMIN_PASS=ci-check-pass -e NETPROOF_DB=/app/backend/data/ci.db -p 8123:8000 netproof:ci
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8123/health >/dev/null; then echo "health ok"; exit 0; fi
+            sleep 2
+          done
+          docker logs np-ci || true
+          exit 1

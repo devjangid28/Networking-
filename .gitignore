@@ -20,6 +20,9 @@ __pycache__/
 lib/venv/
 lib/venv/**/*.pyc
 
+# frontend harness deps (web/harness/package-lock.json pins the versions)
+node_modules/
+
 # Local databases (recreated at startup by run.ps1)
 *.db
 *.db-journal

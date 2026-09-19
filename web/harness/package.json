@@ -1,0 +1,13 @@
+{
+  "name": "netproof-web-harness",
+  "private": true,
+  "version": "0.3.0",
+  "description": "jsdom harness that loads the REAL NetProof dashboard (index.html + app.js) from a running server and asserts behavior.",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "harness": "node harness.js"
+  },
+  "devDependencies": {
+    "jsdom": "^24.0.0"
+  }
+}

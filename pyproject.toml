@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netproof"
+version = "0.3.0"
+description = "Neutral network-change validator for AI agents and humans"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "NetProof" }]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pyyaml>=6.0",
+    "pydantic>=2.6",
+    "mcp>=1.2,<2",
+]
+
+[project.scripts]
+netproof-server = "netproof.launcher:main"
+
+[tool.setuptools.packages.find]
+include = ["backend*", "agent*"]
+
+[tool.setuptools.package-data]
+backend = ["data/acme_office.yaml", "data/orgs/*.yaml"]
+
+[tool.ruff]
+line-length = 120
+src = ["backend", "agent"]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501", "UP035"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "backend"
+plugins = []
+ignore_missing_imports = true
+warn_unused_ignores = false
+packages = ["backend.engine"]

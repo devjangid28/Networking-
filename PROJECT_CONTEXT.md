@@ -490,7 +490,9 @@ Environment variables (`NETPROOF_*`): `ADMIN_PASS` (required), `ADMIN_USER`,
 ## 10. Frontend (web/)
 
 Single-page dashboard, vanilla JS, no framework/build step (`index.html` +
-`styles.css` + `app.js`, cache-busted as `app.js?v=0.9.1`). Three modes via the
+`styles.css` + `app.js`, cache-busted as `app.js?v=0.3.0` — the buster tracks
+`metainfo.PROJECT_VERSION` so docs, frontend, image tag and the version
+consistency gate in `tests/test_release_checks.py` stay aligned). Three modes via the
 mode pills in the header:
 - **Demo** — preloaded `acme_office.yaml` sample (banner warns it is demo data).
 - **Live** — "scan this LAN": target IP/CIDR + "I own this network" consent
@@ -669,7 +671,9 @@ frontend/architecture split; then propose the single highest-value next feature.
     reality), run button held disabled until evidence is stored (a run with no
     evidence is meaningless), status badge, mismatch cards, health-check list,
     coverage/freshness, rollback card, and a diagnostic-bundle download.
-    Cache-buster bumped to `app.js?v=0.9.1`. A real UI bug (run button gated on
+    Cache-buster now tracks `metainfo.PROJECT_VERSION` (`app.js?v=0.3.0`); the old
+ad-hoc `0.9.1` buster is gone and `test_release_checks.py` enforces it. A real UI
+bug (run button gated on
     a result that only a run could create — permanently disabled) was found and
     fixed by the harness.
   - **Verification:** backend suite **207 passed** (159 baseline + 36

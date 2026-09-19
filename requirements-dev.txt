@@ -1,0 +1,4 @@
+# Development / CI-only dependencies (never installed in the runtime image).
+ruff>=0.5
+mypy>=1.11
+pip-audit>=2.7
