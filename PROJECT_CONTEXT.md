@@ -465,8 +465,10 @@ Environment variables (`NETPROOF_*`): `ADMIN_PASS` (required), `ADMIN_USER`,
   DB in place.
 - Sessions in SQLite, httponly cookie; `Secure` when behind TLS.
 - CSRF: cookie-authenticated state changes must be same-origin (`backend/csrf.py`,
-  A3) — cross-site `Origin`/`Referer` → 403; non-browser and cookie-less
-  requests pass; `/api/login` exempt; `NETPROOF_ALLOWED_ORIGINS` allowlisted.
+  A3) — cross-site `Origin`/`Referer` → 403; userinfo origin smuggling
+  (`https://evil.example@testserver/`) is rejected even though it resolves to the
+  trusted host; non-browser and cookie-less requests pass; `/api/login` exempt;
+  `NETPROOF_ALLOWED_ORIGINS` allowlisted.
 - Rate limiting per client IP; proxy headers trusted only when explicitly
   configured (`NETPROOF_DOMAIN` / `NETPROOF_TRUST_PROXY`).
 - Global request-body bound (A5): `NETPROOF_MAX_BODY_BYTES` (default 8 MiB)
@@ -652,7 +654,18 @@ a scratch/diagnostic script for exercising the agent-report path outside pytest.
   `sensitives_present` clean-oracle, at-rest DB rows and bundle exports, plus a
   structural reconciliation lock (scanner families ⊆ redaction vocabulary and
   vice-versa samples still flagged).
-- Full gate green on 2026-09-19: pytest **335 passed**, harness **40/40**,
+- New A2 adversarial tests `backend/tests/test_security_adversarial.py` (51) —
+  hostile request-id injection (never reflected, always re-minted), hardened
+  error responses (401/403/404/413/429 all keep CSP+nosniff+request-id), CSRF
+  evasions (upper/padded/nullish origins, cross-port, host-prefix/suffix,
+  comma-merged, duplicate headers, userinfo smuggling, scheme-relative/null
+  Referers), body-size bypasses (lying/malformed/negative Content-Length,
+  many-chunk floods), rate-limit 429 hardening, revoked-session cookie replay,
+  forged `X-Forwarded-Proto` without proxy trust, and env-style credential keys
+  (`ADMIN_PASS`, `root_pass`, …) in redaction. Found + closed a real gap: Origin
+  `https://evil.example@testserver/` resolved to the trusted host and passed the
+  same-origin check until userinfo is now rejected.
+- Full gate green on 2026-09-19: pytest **395 passed**, harness **40/40**,
   presets **13/13**, `pip-audit -r requirements.txt` **0 vulnerabilities**.
 
 ---
@@ -680,13 +693,15 @@ validation, intent + guardrails, multi-tenant agent model, audit/replay,
 **evidence-aware post-change verification**, metrics, TLS deployment, MCP interface.
 
 **Production-readiness roadmap (Phases A–H) in progress — status:**
-- Phase A (release/security gate): A0–A1–A3–A4–A5–A6 COMPLETE; A2 NOT STARTED.
-- A1: CI + release-checks gate green (335 pytest / 13 presets / 40 harness / ruff+mypy new-code / pip-audit clean / secret scan).
+- Phase A (release/security gate): **A0–A6 ALL COMPLETE** — release + CI gate,
+  strict headers/request-id, CSRF, body-size bound, redaction, adversarial tests.
+- A1: CI + release-checks gate green (395 pytest / 13 presets / 40 harness / ruff+mypy new-code / pip-audit clean / secret scan).
 - A4: strict default security headers + request-id COMPLETE; harness 6/6 new assertions green.
 - A5: global request-body size bound COMPLETE (`backend/limits.py` + 9 tests) — body memory capped at `NETPROOF_MAX_BODY_BYTES` on state-changing requests.
 - A6: hardened at-rest redaction COMPLETE (`backend/engine/postchange.py` + 93 tests) — key-variant + value-class coverage reconciled with `scripts/secret_scan.py`.
+- A2: adversarial Phase-A security tests COMPLETE (`backend/tests/test_security_adversarial.py` + 51 tests) — incl. a found-and-fixed CSRF userinfo-origin gap.
 - Local Docker verified run remains BLOCKED BY ENVIRONMENT (no Docker binary); ubuntu CI carries the Docker gate.
-- Backlog: legacy ruff/mypy debt (Phase C), A2, Phases B–H.
+- Backlog: legacy ruff/mypy debt (Phase C), Phases B–H.
 
 **Bug-status reconciliation (2026-09-18, verified against the current code):**
 - *"`intent.py` has an `or True` bug"* — **not present.** `grep` for `or True` /
@@ -711,6 +726,19 @@ frontend/architecture split; then propose the single highest-value next feature.
 
 ## 14. Changelog (updated after every change)
 
+- **2026-09-19 — Phase A: adversary-style security probes (A2).** New
+  `backend/tests/test_security_adversarial.py` (51) exercises every Phase A
+  defence under abuse. It found and fixed a real CSRF bypass: an Origin of
+  `https://evil.example@testserver/` resolves to host `testserver` (userinfo is
+  stripped by the URL parser), so it passed the same-origin check — `csrf.py`
+  now rejects any Origin/Referer with userinfo. Also hardened redaction exact
+  keys for env-style spellings (`ADMIN_PASS`, `root_pass`, …) and added precise
+  compound tokens (`adminpass`, `dbpass`, …) without a bare "pass" substring
+  (so `bypass`/`passenger` keys are untouched). Confirmed: request-id is never
+  reflected verbatim when hostile, every error status keeps the strict
+  headers, lying/malformed/negative Content-Length and chunked floods stay
+  capped, revoked-session cookies stop authenticating, and forged
+  `X-Forwarded-Proto` gains no HSTS/upgrade without the configured domain.
 - **2026-09-19 — Phase A: hardened at-rest evidence redaction (A6).** Fixed two
   real redaction gaps in `backend/engine/postchange.py`: (1) key names with
   prefixes / camelCase / hyphens / dots that previously slipped through exact-key

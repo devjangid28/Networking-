@@ -63,6 +63,8 @@ _SECRET_KEYS = {
     "client_secret", "shared_secret", "refresh_token", "id_token",
     "auth_token", "access_token", "secret_token", "bearer", "credential",
     "credentials",
+    "admin_pass", "db_pass", "user_pass", "root_pass", "app_pass",
+    "master_pass", "login_pass", "pass", "passcode",
 }
 # Bare secret tokens matched against the *squished* key name (lowercased with
 # every separator removed, e.g. "preSharedKey" -> "presharedkey"), so
@@ -74,6 +76,7 @@ _KEY_SECRET_TOKENS = (
     "authpass", "community", "snmpcomm", "apikey", "accesskey", "authkey",
     "sessiontoken", "privatekey", "rootpassword", "enablepassword",
     "presharedkey", "sharedsecret", "clientsecret",
+    "adminpass", "apppass", "dbpass", "userpass", "masterpass", "loginpass",
 )
 _SECRET_PATTERN = re.compile(
     r"(?i)(password|passwd|pwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|"

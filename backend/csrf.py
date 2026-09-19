@@ -59,6 +59,10 @@ def _is_same_host(origin: str, request: Request) -> bool:
     parsed = urlparse(clean)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return False
+    # userinfo smuggling: "https://evil.example@testserver/" resolves to the
+    # host "testserver" but is an attacker-controlled origin; never trust it.
+    if parsed.username or "@" in (parsed.netloc or ""):
+        return False
     host = (request.headers.get("host") or "").lower()
     if not host:
         return False
