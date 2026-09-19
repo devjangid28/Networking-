@@ -42,6 +42,7 @@ from security import (
     require_session,
     user_for_token,
 )
+import security_headers as security_headers_mod
 from engine.audit import (
     change_fingerprint,
     get_snapshot,
@@ -146,6 +147,20 @@ async def enforce_https(request: Request, call_next):
     response = await call_next(request)
     if forwarded == "https":
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+# Phase A4: strict default security headers + request correlation id. Declared
+# after the other two middlewares so it runs outermost and stamps every response
+# (including the 307 TLS bump above). FastAPI's user-middleware stack runs the
+# LAST-added middleware first.
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    request.state.request_id = security_headers_mod.resolve_request_id(
+        request.headers.get(security_headers_mod.REQUEST_ID_HEADER)
+    )
+    response = await call_next(request)
+    security_headers_mod.apply_to(response, request.state.request_id)
     return response
 
 

@@ -14,9 +14,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # backend/
 ROOT = Path(__file__).resolve().parent.parent.parent
 
 import yaml  # noqa: E402
+
+import main as main_mod  # noqa: E402
 from engine.metainfo import PROJECT_VERSION  # noqa: E402
 from engine.validate import ALL_PRESETS  # noqa: E402
-import main as main_mod  # noqa: E402
 
 
 def _read_text(rel: str) -> str:

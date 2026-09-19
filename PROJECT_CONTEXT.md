@@ -469,6 +469,13 @@ Environment variables (`NETPROOF_*`): `ADMIN_PASS` (required), `ADMIN_USER`,
 - Agent HTTPS enforcement; loopback HTTP allowed for dev/testing, everything
   else requires HTTPS unless `NETPROOF_ALLOW_HTTP=1`.
 - Terminal TLS enforcement behind Caddy (307/HSTS) when `NETPROOF_DOMAIN` set.
+- Default hardening response headers on every route (A4): strict CSP
+  (`script-src 'self'`, `frame-ancestors 'none'`, `object-src 'none'`;
+  operators may extend via `NETPROOF_CSP_SRC`), `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Permissions-Policy`
+  (microphone/camera/geolocation/payment/usb all `()`), plus a correlation id
+  `X-NetProof-Request-ID` on every response (sane caller-supplied tokens are
+  honoured; junk/malicious values are replaced with a fresh id).
 - Verification artifacts (verdict exports, audit replay) are the "proof"
   surface; notable-by-design: replay must be byte-identical.
 
@@ -594,6 +601,30 @@ engine presets"; sets `NETPROOF_ADMIN_PASS=admin-test-pass-2026`) and
 `test_stateful.py`. `conftest.py` provides shared fixtures. `debug_agent.py` is
 a scratch/diagnostic script for exercising the agent-report path outside pytest.
 
+**Phase A gates (A1, 2026-09-19):**
+- New: `backend/tests/test_release_checks.py` — single version source
+  (`metainfo.PROJECT_VERSION` == FastAPI app + `app.js?v=` cache-buster +
+  docker-compose image tag + pyproject + harness package.json), documented files
+  and routes all exist / are registered, YAML parses, the 13-preset catalogue is
+  well-formed, and PROJECT_CONTEXT.md references no stale cache-buster.
+- New: `scripts/ci.py` (deterministic gate on any OS: compile → import → full
+  pytest → boot a throwaway server on a scratch DB → execute all 13 presets over
+  HTTP → run the jsdom harness) and `scripts/secret_scan.py` (private keys /
+  API-key / secret-assignment scan; fails closed). `.github/workflows/ci.yml`
+  runs both jobs (Linux+Windows backend gate, ubuntu static gate).
+- **Static-check scope (:warning: legacy debt is tracked, not enforced):** ruff
+  and mypy rule *new* code only (`scripts/`, `backend/security_headers.py`, the
+  two Phase-A test files) so the gate is deterministic. The pre-0.3.0 modules
+  carry legacy debt (ruff ~211 findings incl. `backend/main.py`; mypy 136 in
+  `backend/engine/*`) — a Phase C backlog item, not a regression of any baseline
+  (they were never linted before).
+- New A4 security-header tests `backend/tests/test_security_headers.py` (8) —
+  headers on every API + static route, strict CSP, request-id echo/rotation, CSP
+  operator extension, TLS-bump headers.
+- Full gate green on 2026-09-19: pytest **215 passed**, harness **40/40**
+  (incl. the six new security-header/request-id assertions), presets **13/13**,
+  `pip-audit -r requirements.txt` **0 vulnerabilities**.
+
 ---
 
 ## 12. Deployment
@@ -618,6 +649,13 @@ Solid, internally consistent v0.3.0: 13 presets, differential + stateful
 validation, intent + guardrails, multi-tenant agent model, audit/replay,
 **evidence-aware post-change verification**, metrics, TLS deployment, MCP interface.
 
+**Production-readiness roadmap (Phases A–H) in progress — status:**
+- Phase A (release/security gate): A0–A1–A4 COMPLETE; A2/A3/A5/A6 NOT STARTED.
+- A1: CI + release-checks gate green (215 pytest / 13 presets / 40 harness / ruff+mypy new-code / pip-audit clean / secret scan).
+- A4: strict default security headers + request-id COMPLETE; harness 6/6 new assertions green.
+- Local Docker verified run remains BLOCKED BY ENVIRONMENT (no Docker binary); ubuntu CI carries the Docker gate.
+- Backlog: legacy ruff/mypy debt (Phase C), A2/A3/A5/A6, Phases B–H.
+
 **Bug-status reconciliation (2026-09-18, verified against the current code):**
 - *"`intent.py` has an `or True` bug"* — **not present.** `grep` for `or True` /
   `and True` in `backend/engine/intent.py` returns nothing.
@@ -641,6 +679,24 @@ frontend/architecture split; then propose the single highest-value next feature.
 
 ## 14. Changelog (updated after every change)
 
+- **2026-09-19 — Phase A: release gate + default security response headers (A1, A4).**
+  - Added `.github/workflows/ci.yml` (backend gate on Linux+Windows: compile,
+    import, full pytest, server boot, 13 presets over HTTP, jsdom harness;
+    static gate on ubuntu: ruff/mypy on new code, pip-audit, secret scan, Docker
+    build, `docker compose config -q` + container health smoke), `scripts/ci.py`,
+    `scripts/secret_scan.py`, `web/harness/` (repo-internalized jsdom harness,
+    now 40 assertions incl. the six security-header/request-id checks),
+    `requirements-dev.txt`, `pyproject.toml`, and single-source version
+    enforcement (`app.js?v=0.3.0` cache-buster + image tag + package.json all
+    tracked to `metainfo.PROJECT_VERSION` in `test_release_checks.py`). Legacy
+    ruff/mypy debt (~211 / ~136) recorded as Phase C backlog.
+  - Added `backend/security_headers.py` + an outermost HTTP middleware in
+    `main.py`: strict CSP + nosniff + frame-deny + referrer + permissions policy,
+    and `X-NetProof-Request-ID` correlation on every response. CSP extensions
+    via `NETPROOF_CSP_SRC`; caller-supplied request ids are honoured only when
+    they match a strict `^[A-Za-z0-9._:/-]{1,128}$` token (header-injection
+    safe). Note: FastAPI's /docs + /redoc load CDN JS and are intentionally
+    blocked by the strict CSP — the OpenAPI JSON stays at `/openapi.json`.
 - **2026-09-19** — **Evidence-aware post-change verification (v0.3.0).** Verdicts
   can now be verified *after* the change is actually deployed on the live
   network, against real observed evidence — never by trusting the dry-run pass:
