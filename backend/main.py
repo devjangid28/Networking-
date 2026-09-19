@@ -43,6 +43,7 @@ from security import (
     user_for_token,
 )
 import security_headers as security_headers_mod
+import csrf
 from engine.audit import (
     change_fingerprint,
     get_snapshot,
@@ -148,6 +149,14 @@ async def enforce_https(request: Request, call_next):
     if forwarded == "https":
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
+
+
+# Phase A3: CSRF origin enforcement for cookie-authenticated state changes.
+# Declared under security_headers so the 403 it returns still gets the strict
+# headers + request id. (Server middleware runs in reverse declaration order.)
+@app.middleware("http")
+async def csrf_guard(request: Request, call_next):
+    return await csrf.csrf_middleware(request, call_next)
 
 
 # Phase A4: strict default security headers + request correlation id. Declared

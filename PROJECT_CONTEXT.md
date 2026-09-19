@@ -464,6 +464,9 @@ Environment variables (`NETPROOF_*`): `ADMIN_PASS` (required), `ADMIN_USER`,
   digests; a legacy migration path digests any plaintext keys found in an older
   DB in place.
 - Sessions in SQLite, httponly cookie; `Secure` when behind TLS.
+- CSRF: cookie-authenticated state changes must be same-origin (`backend/csrf.py`,
+  A3) — cross-site `Origin`/`Referer` → 403; non-browser and cookie-less
+  requests pass; `/api/login` exempt; `NETPROOF_ALLOWED_ORIGINS` allowlisted.
 - Rate limiting per client IP; proxy headers trusted only when explicitly
   configured (`NETPROOF_DOMAIN` / `NETPROOF_TRUST_PROXY`).
 - Agent HTTPS enforcement; loopback HTTP allowed for dev/testing, everything
@@ -650,8 +653,8 @@ validation, intent + guardrails, multi-tenant agent model, audit/replay,
 **evidence-aware post-change verification**, metrics, TLS deployment, MCP interface.
 
 **Production-readiness roadmap (Phases A–H) in progress — status:**
-- Phase A (release/security gate): A0–A1–A4 COMPLETE; A2/A3/A5/A6 NOT STARTED.
-- A1: CI + release-checks gate green (215 pytest / 13 presets / 40 harness / ruff+mypy new-code / pip-audit clean / secret scan).
+- Phase A (release/security gate): A0–A1–A3–A4 COMPLETE; A2/A5/A6 NOT STARTED.
+- A1: CI + release-checks gate green (233 pytest / 13 presets / 40 harness / ruff+mypy new-code / pip-audit clean / secret scan).
 - A4: strict default security headers + request-id COMPLETE; harness 6/6 new assertions green.
 - Local Docker verified run remains BLOCKED BY ENVIRONMENT (no Docker binary); ubuntu CI carries the Docker gate.
 - Backlog: legacy ruff/mypy debt (Phase C), A2/A3/A5/A6, Phases B–H.
@@ -679,6 +682,16 @@ frontend/architecture split; then propose the single highest-value next feature.
 
 ## 14. Changelog (updated after every change)
 
+- **2026-09-19 — Phase A: CSRF origin enforcement (A3).** New `backend/csrf.py`
+  + an HTTP middleware (runs under the security-header middleware so its 403s
+  still carry CSP/nosniff/request-id): cookie-authenticated POST/PUT/PATCH/DELETE
+  requests are rejected 403 when their `Origin` is cross-site, `null`, or — when
+  `Origin` is absent — when their `Referer` is cross-site. Non-browser clients
+  (no Origin, no Referer) and cookie-less requests pass; `/api/login` is exempt
+  (login CSRF only ever signs the victim into attacker-chosen creds).
+  `NETPROOF_ALLOWED_ORIGINS` (the CORS allowlist) is honoured for deliberately
+  integrated foreign dashboards. `backend/tests/test_csrf.py` (10) covers all
+  branches.
 - **2026-09-19 — Phase A: release gate + default security response headers (A1, A4).**
   - Added `.github/workflows/ci.yml` (backend gate on Linux+Windows: compile,
     import, full pytest, server boot, 13 presets over HTTP, jsdom harness;
