@@ -26,7 +26,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .metainfo import PROJECT_VERSION
 
@@ -60,12 +60,45 @@ _SECRET_KEYS = {
     "session_token", "token", "community", "snmp_community",
     "root_password", "enable", "enable_password", "auth_key", "authpass",
     "priv", "priv_key", "snmpv3_priv", "passphrase", "psk", "pre_shared_key",
+    "client_secret", "shared_secret", "refresh_token", "id_token",
+    "auth_token", "access_token", "secret_token", "bearer", "credential",
+    "credentials",
 }
+# Bare secret tokens matched against the *squished* key name (lowercased with
+# every separator removed, e.g. "preSharedKey" -> "presharedkey"), so
+# prefixed / camelCase / hyphen / dotted spellings of a credential key are all
+# caught. Deliberately generous: over-redaction at rest is safe (the engine has
+# already run), under-redaction leaks credentials into evidence exports.
+_KEY_SECRET_TOKENS = (
+    "password", "passwd", "passphrase", "secret", "psk", "credential",
+    "authpass", "community", "snmpcomm", "apikey", "accesskey", "authkey",
+    "sessiontoken", "privatekey", "rootpassword", "enablepassword",
+    "presharedkey", "sharedsecret", "clientsecret",
+)
 _SECRET_PATTERN = re.compile(
     r"(?i)(password|passwd|pwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|"
-    r"session[_-]?token|token|community|snmp[_-]?community|passphrase|psk)\s*[=:]\s*\S+"
+    r"session[_-]?token|token|community|snmp[_-]?community|passphrase|psk|"
+    r"auth[_-]?key|shared[_-]?secret|client[_-]?secret|pre[_-]?shared[_-]?key|"
+    r"bearer|credential)\s*[\"']?\s*[=:]\s*[\"']?\S+"
 )
-_TIMEZONE = _dt.timezone.utc
+_SECRET_URL_QUERY = re.compile(
+    r"(?i)[?&](?:api[_-]?key|auth[_-]?key|access[_-]?key|private[_-]?key|token|secret|passwd?)=[^&\s]+"
+)
+_SECRET_BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=\-]+")
+_SECRET_PEM = re.compile(
+    r"-----BEGIN [A-Z0-9 ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]+PRIVATE KEY-----"
+)
+# Value-class patterns shared with scripts/secret_scan.py: any of these in an
+# evidence string must be scrubbed so the proof surface never ships a
+# credential the repository's own scanner would refuse to commit.
+_SECRET_VALUE_PATTERNS = [
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AWS access key"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"), "API key (sk-...)"),
+    (re.compile(r"\bghp_[A-Za-z0-9]{36,}\b"), "GitHub token"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"), "Slack token"),
+    (_SECRET_PEM, "private key block"),
+]
+_TIMEZONE = _dt.UTC
 
 _MAX_UNEXPECTED = 20
 
@@ -118,9 +151,9 @@ class PredictedDelta:
     kind: str
     change_type: str
     expected_present: bool
-    expected: Optional[dict]
-    before: Optional[dict]
-    index: Optional[int] = None
+    expected: dict | None
+    before: dict | None
+    index: int | None = None
     impact: str = "info"
     advisory: bool = False
     needs_before: bool = False
@@ -134,8 +167,8 @@ class VerificationMismatch:
     label: str
     kind: str
     status: str
-    expected: Optional[dict]
-    observed: Optional[dict]
+    expected: dict | None
+    observed: dict | None
     evidence_ids: list[str]
     severity: str
     detail: str
@@ -157,7 +190,7 @@ def iso_now() -> str:
     return _dt.datetime.now(_TIMEZONE).isoformat(timespec="seconds")
 
 
-def iso_parse(text: str) -> Optional[_dt.datetime]:
+def iso_parse(text: str) -> _dt.datetime | None:
     try:
         return _dt.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
     except (ValueError, TypeError):
@@ -168,16 +201,32 @@ def iso_parse(text: str) -> Optional[_dt.datetime]:
 # secret redaction                                                            #
 # --------------------------------------------------------------------------- #
 
-def _redact_value(value: Any, key: Optional[str] = None) -> Any:
+def _squish_key(key: str) -> str:
+    return "".join(ch for ch in str(key).lower() if ch.isalnum())
+
+
+def _is_sensitive_key(key: str) -> bool:
+    raw = str(key or "").strip()
+    camel_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", raw).lower()
+    lowered = camel_split.replace("-", "_").replace(".", "_").replace(" ", "_").replace("/", "_")
+    if lowered in _SECRET_KEYS or lowered.endswith(("_key", "_token")):
+        return True
+    squished = _squish_key(raw)
+    return any(token in squished for token in _KEY_SECRET_TOKENS)
+
+
+def _redact_value(value: Any, key: str | None = None) -> Any:
     if isinstance(value, dict):
         return {k: _redact_value(v, k) for k, v in value.items()}
     if isinstance(value, list):
         return [_redact_value(v, key) for v in value]
     if isinstance(value, str):
-        lowered = (key or "").lower()
-        if lowered in _SECRET_KEYS or lowered.endswith("_key") or lowered.endswith("_token"):
+        if _is_sensitive_key(key):
             return "[REDACTED]"
-        return _SECRET_PATTERN.sub("[REDACTED]", value)
+        for regex, _label in _SECRET_VALUE_PATTERNS:
+            value = regex.sub("[REDACTED]", value)
+        value = _SECRET_PATTERN.sub("[REDACTED]", value)
+        return _SECRET_BEARER.sub("[REDACTED]", _SECRET_URL_QUERY.sub("[REDACTED]", value))
     return value
 
 
@@ -185,24 +234,37 @@ def redact_secrets(value: Any) -> Any:
     """Recursively scrub credentials from any JSON-ish structure.
 
     Sensitive key names (passwords, API keys, private keys, SNMP community
-    strings, session tokens) are replaced with ``[REDACTED]``; inline
-    ``name=value`` credential text inside strings is masked too.
+    strings, session tokens — including prefixed / camelCase / hyphen / dotted
+    spellings) are replaced with ``[REDACTED]``; inline ``name=value`` text,
+    URL query credentials, ``Bearer`` tokens, PEM private-key blocks and the
+    value classes cleared by ``scripts/secret_scan.py`` (AWS keys, ``sk-``
+    keys, GitHub/Slack tokens) are masked inside strings too.
     """
     return _redact_value(value)
 
 
 def sensitives_present(value: Any) -> bool:
-    """True when a structure still contains an un-redacted secret."""
+    """True when a structure still contains an un-redacted secret.
+
+    Used as the 'is this clean?' oracle: already-redacted sentinels
+    (``[REDACTED]``) are treated as clean, so the key *name* alone never
+    triggers once the value has been scrubbed.
+    """
     if isinstance(value, dict):
         for k, v in value.items():
-            if str(k).lower() in _SECRET_KEYS or str(k).lower().endswith(("_key", "_token")):
+            if _is_sensitive_key(k) and isinstance(v, str) and v != "[REDACTED]":
                 return True
             if sensitives_present(v):
                 return True
     elif isinstance(value, list):
         return any(sensitives_present(v) for v in value)
     elif isinstance(value, str):
-        return bool(_SECRET_PATTERN.search(value))
+        if value == "[REDACTED]":
+            return False
+        if any(regex.search(value) for regex, _label in _SECRET_VALUE_PATTERNS):
+            return True
+        if _SECRET_PATTERN.search(value) or _SECRET_URL_QUERY.search(value) or _SECRET_BEARER.search(value):
+            return True
     return False
 
 
@@ -604,7 +666,7 @@ def _config_section(pre_change_evidence: dict, config_key: str, section: str) ->
     return conf.get(section)
 
 
-def _attach_before_values(change: dict, deltas: list['PredictedDelta'], pre_change_evidence: dict) -> None:
+def _attach_before_values(change: dict, deltas: list[PredictedDelta], pre_change_evidence: dict) -> None:
     ctype = change.get("type", "")
     if ctype in ("remove_filter_rule", "replace_filter_rule"):
         fname = str(change.get("filter", ""))
@@ -666,7 +728,7 @@ def _attach_before_values(change: dict, deltas: list['PredictedDelta'], pre_chan
         return
 
 
-def _before_filter_rule(pre_change_evidence: dict, fname: str, idx: int) -> Optional[dict]:
+def _before_filter_rule(pre_change_evidence: dict, fname: str, idx: int) -> dict | None:
     config = pre_change_evidence.get("config") or {}
     if not isinstance(config, dict):
         return None
@@ -685,7 +747,7 @@ def _before_filter_rule(pre_change_evidence: dict, fname: str, idx: int) -> Opti
     return None
 
 
-def _before_value_in_list(change: dict, section: str, rules: list) -> Optional[dict]:
+def _before_value_in_list(change: dict, section: str, rules: list) -> dict | None:
     if section == "bgp":
         peer = change.get("peer") or change.get("bgp_peer") or change
         neighbor = str(peer.get("neighbor") or "")
@@ -735,7 +797,7 @@ def _canonical_section_items(section: str, payload: Any) -> list[str]:
     return items
 
 
-def build_prediction(report: dict, pre_change_evidence: Optional[dict] = None) -> dict:
+def build_prediction(report: dict, pre_change_evidence: dict | None = None) -> dict:
     """Derive the predicted post-change state from a stored verdict report.
 
     The prediction is built ONLY from the persisted report (matrix,
@@ -833,7 +895,7 @@ def extract_observations(evidence_docs: list[dict]) -> list[dict]:
     return [merged[k] for k in order if not merged[k].get("stale")]
 
 
-def _is_stale(collected_at: str, now: Optional[_dt.datetime] = None) -> bool:
+def _is_stale(collected_at: str, now: _dt.datetime | None = None) -> bool:
     ts = iso_parse(collected_at)
     if ts is None:
         return True
@@ -982,7 +1044,7 @@ def _section_has(section: str, obs: dict, delta: PredictedDelta) -> bool:
     return False
 
 
-def _match_expectation(delta: PredictedDelta, found: bool) -> Optional[dict]:
+def _match_expectation(delta: PredictedDelta, found: bool) -> dict | None:
     if delta.expected_present:
         if found:
             return {"match": True, "message": "expected resource present", "mismatch": None}
@@ -1021,7 +1083,7 @@ def _match_expectation(delta: PredictedDelta, found: bool) -> Optional[dict]:
 
 
 def _candidate_observations(delta: PredictedDelta, observations: list[dict],
-                            device_map: Optional[dict] = None) -> list[dict]:
+                            device_map: dict | None = None) -> list[dict]:
     section = delta.section
     device = delta.device
     aliases: set[str] = set()
@@ -1047,7 +1109,7 @@ def _candidate_observations(delta: PredictedDelta, observations: list[dict],
 
 
 def _check_delta(delta: PredictedDelta, observations: list[dict],
-                 precedence: Optional[list[str]], device_map: Optional[dict] = None) -> dict:
+                 precedence: list[str] | None, device_map: dict | None = None) -> dict:
     candidates = _candidate_observations(delta, observations, device_map)
     if not candidates:
         return {
@@ -1125,7 +1187,7 @@ def _precedence_index(source: str, precedence: list[str]) -> int:
 
 
 def compare_observed_state(prediction: dict, observations: list[dict],
-                           source_precedence: Optional[list[str]] = None) -> dict:
+                           source_precedence: list[str] | None = None) -> dict:
     """Compare observed post-change evidence against the predicted state.
 
     Returns the verification result with a lifecycle status. Missing, stale or
@@ -1173,7 +1235,7 @@ def compare_observed_state(prediction: dict, observations: list[dict],
 
 
 def _status_for(prediction: dict, deltas: list[PredictedDelta], results: list[dict],
-                mismatches: list[dict], unexpected: Optional[list[dict]] = None) -> tuple[str, list[str]]:
+                mismatches: list[dict], unexpected: list[dict] | None = None) -> tuple[str, list[str]]:
     edge_cases: list[str] = []
     change = prediction.get("change") or {}
 
@@ -1296,7 +1358,7 @@ def _hck(ident, status, expected, observed, evidence_ids, confidence, explanatio
     }
 
 
-def run_health_checks(model, observations: list[dict], requirements: Optional[list[dict]] = None) -> list[dict]:
+def run_health_checks(model, observations: list[dict], requirements: list[dict] | None = None) -> list[dict]:
     """Run read-only health checks from observations against a model.
 
     ``model`` may be a reconstructed ``Net`` (from the stored snapshot) or
@@ -1484,7 +1546,7 @@ _TRIGGER_TITLES = {
 }
 
 
-def inverse_change(change: dict, prediction: Optional[dict] = None) -> tuple[Optional[dict], list[str]]:
+def inverse_change(change: dict, prediction: dict | None = None) -> tuple[dict | None, list[str]]:
     """Derive a deterministic inverse change (never vendor commands).
 
     Returns ``(inverse, warnings)``. ``inverse`` is ``None`` when a safe inverse
@@ -1493,7 +1555,7 @@ def inverse_change(change: dict, prediction: Optional[dict] = None) -> tuple[Opt
     """
     ctype = change.get("type", "")
     warnings: list[str] = []
-    before_for: Optional[dict] = None
+    before_for: dict | None = None
 
     if ctype == "add_filter_rule":
         filt = str(change.get("filter", ""))
@@ -1593,7 +1655,7 @@ def inverse_change(change: dict, prediction: Optional[dict] = None) -> tuple[Opt
     return None, warnings
 
 
-def _before_for_change(change: dict, prediction: Optional[dict]) -> Optional[dict]:
+def _before_for_change(change: dict, prediction: dict | None) -> dict | None:
     ctype = change.get("type", "")
     for d in (prediction or {}).get("deltas") or []:
         if d.get("change_type") != ctype:
@@ -1604,7 +1666,7 @@ def _before_for_change(change: dict, prediction: Optional[dict]) -> Optional[dic
     return None
 
 
-def _trigger_for(mismatch: dict) -> Optional[str]:
+def _trigger_for(mismatch: dict) -> str | None:
     section = str(mismatch.get("section", ""))
     label = str(mismatch.get("label", ""))
     if "flow" in label or section == "reachability" or section == "requirements":
@@ -1620,7 +1682,7 @@ def _trigger_for(mismatch: dict) -> Optional[str]:
     return None
 
 
-def build_rollback_recommendation(verification: dict, original_change: Optional[dict] = None) -> dict:
+def build_rollback_recommendation(verification: dict, original_change: dict | None = None) -> dict:
     """Build a read-only rollback recommendation from a completed verification.
 
     Never executes anything. The inverse change is a NetProof change object
@@ -1722,8 +1784,8 @@ def init_verifications(db: str = DEFAULT_DB) -> None:
 
 
 def create_verification(verdict_id: str, org_id: str = "default", requester: str | None = None,
-                        change: Optional[dict] = None, prediction: Optional[dict] = None,
-                        source_precedence: Optional[list[str]] = None,
+                        change: dict | None = None, prediction: dict | None = None,
+                        source_precedence: list[str] | None = None,
                         db: str = DEFAULT_DB) -> dict:
     """Persist a new verification in the ``not_started`` lifecycle state."""
     from .audit import change_fingerprint
@@ -1761,7 +1823,7 @@ def create_verification(verdict_id: str, org_id: str = "default", requester: str
     return payload
 
 
-def get_verification(vid: str, db: str = DEFAULT_DB) -> Optional[dict]:
+def get_verification(vid: str, db: str = DEFAULT_DB) -> dict | None:
     with _verif_lock:
         row = _conn(db).execute("SELECT * FROM verifications WHERE id = ?", (vid,)).fetchone()
     if row is None:
@@ -1836,9 +1898,9 @@ def _persisted_evidence(doc: dict) -> dict:
     return redact_secrets(dict(doc))
 
 
-def run_verification(vid: str, source_precedence: Optional[list[str]] = None, db: str = DEFAULT_DB) -> dict:
+def run_verification(vid: str, source_precedence: list[str] | None = None, db: str = DEFAULT_DB) -> dict:
     """Run comparison + health checks + rollback for a verification."""
-    from .audit import get_verdict, get_snapshot
+    from .audit import get_snapshot, get_verdict
     verification = get_verification(vid, db)
     if verification is None:
         raise KeyError(f"verification '{vid}' not found")
@@ -1879,7 +1941,7 @@ def _as_doc(doc: dict) -> dict:
     return {"content": doc}
 
 
-def _bundle(verification: dict, verdict: Optional[dict]) -> dict:
+def _bundle(verification: dict, verdict: dict | None) -> dict:
     report = (verdict or {}).get("report") or {}
     summary = report.get("summary") or {}
     return {

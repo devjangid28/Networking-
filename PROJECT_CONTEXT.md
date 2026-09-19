@@ -474,6 +474,14 @@ Environment variables (`NETPROOF_*`): `ADMIN_PASS` (required), `ADMIN_USER`,
   stream guard, so declared *and* chunked/oversized bodies never commit memory
   past the cap (413 with the strict headers); engine's tighter per-artefact caps
   unchanged.
+- At-rest evidence redaction (A6): `postchange.redact_secrets` scrubs every
+  credential family before evidence is persisted or exported — prefixed /
+  camelCase / hyphen / dotted secret keys (incl. `wpa_passphrase`,
+  `preSharedKey`, `idToken`), inline `name=value` text, URL-query credentials,
+  Bearer tokens, PEM blocks, and the exact value classes `scripts/secret_scan.py`
+  refuses to commit (AWS/`sk-`/GitHub/Slack tokens); `sensitives_present` is the
+  "is this clean?" oracle. Redaction is deliberately generous — over-redaction
+  at rest is safe (the engine already ran), under-redaction leaks.
 - Agent HTTPS enforcement; loopback HTTP allowed for dev/testing, everything
   else requires HTTPS unless `NETPROOF_ALLOW_HTTP=1`.
 - Terminal TLS enforcement behind Caddy (307/HSTS) when `NETPROOF_DOMAIN` set.
@@ -637,7 +645,14 @@ a scratch/diagnostic script for exercising the agent-report path outside pytest.
   boundary (computed against httpx's compact wire serialisation), chunked body
   without Content-Length streamed and capped, GET unaffected, env override and
   documented default, 413 keeps the security headers.
-- Full gate green on 2026-09-19: pytest **242 passed**, harness **40/40**,
+- New A6 redaction tests `backend/tests/test_redaction.py` (93) — every
+  `_SECRET_KEYS` member + prefix/camelCase/hyphen/dotted spellings, key/token
+  suffixes, inline/URL/Bearer/PEM value forms, the value classes from
+  `scripts/secret_scan.py` under benign keys, idempotency, the
+  `sensitives_present` clean-oracle, at-rest DB rows and bundle exports, plus a
+  structural reconciliation lock (scanner families ⊆ redaction vocabulary and
+  vice-versa samples still flagged).
+- Full gate green on 2026-09-19: pytest **335 passed**, harness **40/40**,
   presets **13/13**, `pip-audit -r requirements.txt` **0 vulnerabilities**.
 
 ---
@@ -665,12 +680,13 @@ validation, intent + guardrails, multi-tenant agent model, audit/replay,
 **evidence-aware post-change verification**, metrics, TLS deployment, MCP interface.
 
 **Production-readiness roadmap (Phases A–H) in progress — status:**
-- Phase A (release/security gate): A0–A1–A3–A4–A5 COMPLETE; A2/A6 NOT STARTED.
-- A1: CI + release-checks gate green (242 pytest / 13 presets / 40 harness / ruff+mypy new-code / pip-audit clean / secret scan).
+- Phase A (release/security gate): A0–A1–A3–A4–A5–A6 COMPLETE; A2 NOT STARTED.
+- A1: CI + release-checks gate green (335 pytest / 13 presets / 40 harness / ruff+mypy new-code / pip-audit clean / secret scan).
 - A4: strict default security headers + request-id COMPLETE; harness 6/6 new assertions green.
 - A5: global request-body size bound COMPLETE (`backend/limits.py` + 9 tests) — body memory capped at `NETPROOF_MAX_BODY_BYTES` on state-changing requests.
+- A6: hardened at-rest redaction COMPLETE (`backend/engine/postchange.py` + 93 tests) — key-variant + value-class coverage reconciled with `scripts/secret_scan.py`.
 - Local Docker verified run remains BLOCKED BY ENVIRONMENT (no Docker binary); ubuntu CI carries the Docker gate.
-- Backlog: legacy ruff/mypy debt (Phase C), A2/A6, Phases B–H.
+- Backlog: legacy ruff/mypy debt (Phase C), A2, Phases B–H.
 
 **Bug-status reconciliation (2026-09-18, verified against the current code):**
 - *"`intent.py` has an `or True` bug"* — **not present.** `grep` for `or True` /
@@ -695,6 +711,21 @@ frontend/architecture split; then propose the single highest-value next feature.
 
 ## 14. Changelog (updated after every change)
 
+- **2026-09-19 — Phase A: hardened at-rest evidence redaction (A6).** Fixed two
+  real redaction gaps in `backend/engine/postchange.py`: (1) key names with
+  prefixes / camelCase / hyphens / dots that previously slipped through exact-key
+  matching (`wpa_passphrase`, `preSharedKey`, `idToken`, …) are now caught via
+  separator + camelCase normalisation plus squished-key substring tokens;
+  (2) inline `"key":"value"` quoted forms were not masked (added optional quote
+  chars to `_SECRET_PATTERN`) and URL-query credentials, `Bearer` tokens and PEM
+  private-key blocks were not scrubbed at all. `sensitives_present` is now a real
+  clean-oracle (redacted sentinels are clean). New value-class patterns match
+  the exact families `scripts/secret_scan.py` refuses to commit (AWS/`sk-`/
+  GitHub/Slack); a structural lock keeps the scanner vocabulary a subset of the
+  redaction vocabulary. `scripts/secret_scan.py` now whitelists
+  `backend/tests/test_redaction.py` (its samples are one literal per redaction
+  family, exactly the red-herring fixture the scanner's docs already promised
+  to ignore). `backend/tests/test_redaction.py` (93).
 - **2026-09-19 — Phase A: global request-body size bound (A5).** New
   `backend/limits.py`: `NETPROOF_MAX_BODY_BYTES` (default 8 MiB) enforced two
   ways — a `Content-Length` pre-check inside the security-header layer

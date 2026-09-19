@@ -9,8 +9,11 @@ Any hit is a hard failure: secrets must never be committed.
 
 False positives are avoided by:
   - only scanning tracked (git) files when the repo is available;
-  - ignoring yaml/whitelist test fixtures under backend/data/orgs and test dirs
-    that intentionally put red-herring values in files;
+  - ignoring whitelisted fixture assets that intentionally put red-herring values
+    in files: yaml under backend/data/orgs, .env.example sample config, and
+    backend/tests/test_redaction.py (its SCANNER_SAMPLES embed one literal per
+    family *specifically* so the A6 reconciliation lock proves every value class
+    below is also scrubbed by postchange.redact_secrets);
   - keeping the rules deliberately narrow (private keys, AWS access keys,
     generic long hex/base64 assignment to secret-looking names).
 """
@@ -23,7 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 SKIP_DIRNAMES = {".git", "lib", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
-SKIP_FILENAMES = {".env", ".env.example", "package-lock.json"}
+SKIP_FILENAMES = {".env", ".env.example", "package-lock.json", "test_redaction.py"}
 BINARY_EXT = {".db", ".pyc", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2", ".ttf"}
 
 _PATTERNS = [
