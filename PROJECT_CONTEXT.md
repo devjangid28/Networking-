@@ -320,6 +320,11 @@ netproof/
       guardrails.py         # per-org data-driven pre-flight policy (YAML rules)
       audit.py              # verdicts table + snapshot/hash/fingerprint + replay +
                             #   unified diff + canonical snapshot
+      postchange.py         # evidence-aware post-change verification: statuses,
+                            #   evidence redaction + source precedence, prediction
+                            #   from the persisted report, expected-vs-observed
+                            #   comparison, mismatch grouping, read-only health
+                            #   checks, rollback recommendation, exportable bundle
       intel.py              # target-intelligence bundle: per-device identity,
                             #   discovery detail, confirmed-vs-inferred, applicable
                             #   org guardrails w/ evidence, validation history,
@@ -363,6 +368,27 @@ netproof/
 - `GET  /api/scan` — fetch the last scan result.
 - `GET  /api/model?mode=scan` — build a `Net` from the active scan.
 - `POST /api/validate` — validate a change (engine). The core referee endpoint.
+  The response now carries an **additive `prediction` block** (from
+  `postchange.py`): what the change must produce post-deployment — `deltas`
+  (expected present new state / expected absent old state, per section), a
+  `summary` (counts + per-section groups + simulation verdict), and the change
+  fingerprint — so the caller can compare predicted vs observed later.
+- `POST /api/verifications` — open a post-change verification for a persisted
+  verdict (`{verdict_id, requester, pre_change_evidence?,
+  source_precedence?}`); rebuilds the prediction from the stored report (never
+  from a fresh simulation).
+- `GET  /api/verifications/{vid}` — verification state (status, evidence
+  excerpts, prediction, result, rollback, bundle id).
+- `POST /api/verifications/{vid}/evidence` — append evidence documents
+  (config snapshot / agent report); stored redacted at rest; per-section source
+  precedence resolved by freshness; → status `awaiting_observation`.
+- `POST /api/verifications/{vid}/run` — compare predicted vs observed: health
+  checks (pass/warn/fail per expected change), mismatches grouped by root
+  cause, unexpected unrelated changes, rollback recommendation (with inverse
+  change when derivable). Read-only — never executes vendor commands.
+- `GET  /api/verifications/{vid}/bundle` — exportable artifact: prediction,
+  evidence, result, health checks, rollback + source verdict summary (secrets
+  always redacted).
 - `POST /api/intent` — parse plain English → change IR.
 - `GET  /api/guardrails`, `POST /api/guardrails` — guardrail policy + pre-flight
   run over a change.
@@ -377,7 +403,11 @@ netproof/
   — org user management (admin role).
 - `GET  /api/verdicts` (list), `GET /api/verdicts/{vid}`,
   `POST /api/verdicts/{vid}/replay` (determinism proof),
-  `GET /api/verdicts/{vid}/export` (JSON artifact), `GET /api/verdicts/{vid}/diff`.
+  `GET /api/verdicts/{vid}/export` (JSON artifact), `GET /api/verdicts/{vid}/bundle`
+  (full diagnostic bundle: trace + checklist + pipeline layers + drift + inventory),
+  `GET /api/verdicts/{vid}/diff`.
+- `GET  /api/drift` — current model vs. the last approved baseline (drift
+  posture, risk level, per-section diffs) independent of any one change.
 - `GET  /api/audit` — admin-only event log.
 - `GET  /api/target/{ip}/intelligence` — per-device target dossier scoped to the
   active model window (demo / scan / agent): identity + discovery detail,
@@ -414,6 +444,11 @@ Environment variables (`NETPROOF_*`): `ADMIN_PASS` (required), `ADMIN_USER`,
     (`admin` / `operator` / `viewer`).
   - `agent_reports` — outbound agent check-ins (per org).
   - `events` — append-only audit-event log.
+  - `verifications` — post-change verification per verdict: status machine
+    (`not_started` → `awaiting_observation` → terminal: `verified`,
+    `verified_with_warnings`, `mismatch`, `failed`, `inconclusive`,
+    `unsupported`), redacted evidence documents + source precedence, prediction
+    snapshot, comparison result, health checks, rollback recommendation, bundle.
 - Guardrails: YAML per org in `ORG_DIR` (built-ins shipped with the engine, org
   files merge over them).
 
@@ -455,7 +490,7 @@ Environment variables (`NETPROOF_*`): `ADMIN_PASS` (required), `ADMIN_USER`,
 ## 10. Frontend (web/)
 
 Single-page dashboard, vanilla JS, no framework/build step (`index.html` +
-`styles.css` + `app.js`, cache-busted as `app.js?v=0.8.0`). Three modes via the
+`styles.css` + `app.js`, cache-busted as `app.js?v=0.9.1`). Three modes via the
 mode pills in the header:
 - **Demo** — preloaded `acme_office.yaml` sample (banner warns it is demo data).
 - **Live** — "scan this LAN": target IP/CIDR + "I own this network" consent
@@ -468,6 +503,27 @@ Sections: Overview (hero, verdict summary), Systems & Policy (topology,
 confirmed/inferred badges), Change & Result (builder + verdict/findings/
 requirements/matrix), Settings (options, audit, admin). Login/logout and
 role-aware UI in the top bar.
+
+**Post-change verification view (v0.3.0):** any persisted verdict gains a
+"Post-change verify" tab. It walks a 5-step lifecycle (capture pre-change
+evidence → dry-run prediction → deploy on the live network → collect
+post-change evidence → compare & health-check) and manages the verification via
+`VERIF_BY_VID`, rendering an evidence JSON editor prefilled by
+`sampleEvidence(report)` with the *predicted* state (which the engineer edits to
+match what was actually deployed), per-section source precedence, and
+`buildPreChangeEvidence()` supplying the baseline. The "Run verification" button
+is held disabled until evidence documents are actually stored (a run with zero
+evidence is meaningless — missing evidence is never success). The result
+section renders: status badge (`verified` / `verified_with_warnings` /
+`mismatch` / `failed` / `inconclusive` / `unsupported`), per-delta confirmation
+stats, mismatch cards grouped by root cause (expected vs observed),
+unexpected-change rows, the read-only health-check list, evidence
+coverage/freshness, and the rollback card (with a replayable inverse change when
+derivable) — plus a "Download diagnostic bundle" link that activates after a
+successful run. The view is generated by `renderVerifyTab`/`vfRenderInto` and
+the helper callables in the verification module inside `web/app.js` (inserted
+between `renderTrace` and `exportReport`); styling lives in the `.vf-*` block at
+the end of `styles.css`.
 
 ### UX affordances (all verified live on 2026-09-18)
 - **Glossary tooltips** — every technical term rendered through `glossHtml()`
@@ -500,16 +556,37 @@ running server) were executed in a jsdom harness against the live backend — 36
 behavioral assertions passed (hover tooltip, mode toggle both ways, walkthrough
 open/dismiss/re-open, risk dialog yes/cancel/escape, direct function calls, and
 the device-inspect Intelligence tab rendering a real bundle from
-`/api/target/{ip}/intelligence`).
+`/api/target/{ip}/intelligence`). On 2026-09-19 the harness grew to **56
+assertions**: verdict parsing against the enhanced pipeline response, the
+after-view "restored" matrix cell, the Phase-7 UI renderers (pipeline bar
+cells + early-stop note, checklist items, hop-by-hop trace cards, drift chip),
+and the dotted-line "journey" fix (a blocked flow's red line now reaches its
+drop device). Every preset in "Propose a change" and every builder change type
+was also exercised over HTTP (verdict, findings, checklist, trace, matrix
+path-node validity), and a live scan of the user's router (`192.168.31.1`)
+produced an all-pairs source→destination matrix whose paths resolve through
+valid topology devices. For the v0.3.0 verification view the harness ran again
+against a fresh server (**34/34**): boot, glossary, mode toggle fallback, risk
+dialog, the result renderers (pipeline bar, checklist, trace, matrix, drift
+chip), the verification view end-to-end (open → sample evidence → save → run →
+terminal status with health checks, rollback card and enabled bundle link), the
+failed path (absent expected change → `failed` + rollback recommended) and
+bundle export. It also caught one real UI bug (run button permanently disabled
+because it was gated on a result only a run could produce) which was fixed in
+`vfRenderInto`.
 
 ---
 
 ## 11. Testing
 
-17 test files under `backend/tests/` covering: agent config, agent HTTPS
+22 test files under `backend/tests/` covering: agent config, agent HTTPS
 policy, consent gate, discovery, end-to-end, filter semantics, target
 intelligence, MCP tools, metrics, config pull, rate limits, RBAC/tenant
-isolation, scan config, snapshots, stateful firewalls, TLS/HSTS, plus
+isolation, scan config, snapshots, stateful firewalls, TLS/HSTS, the
+multi-layer validation pipeline (incl. trace + checklist), the drift/bundle
+diagnostics endpoints, the evidence-aware verification engine
+(`test_postchange.py`, 36) and the verification REST API
+(`test_verifications_api.py`, 12), plus
 `test_new.py` (manual backward-compat + agent endpoint checks, verifies "All 13
 engine presets"; sets `NETPROOF_ADMIN_PASS=admin-test-pass-2026`) and
 `test_stateful.py`. `conftest.py` provides shared fixtures. `debug_agent.py` is
@@ -537,7 +614,7 @@ a scratch/diagnostic script for exercising the agent-report path outside pytest.
 
 Solid, internally consistent v0.3.0: 13 presets, differential + stateful
 validation, intent + guardrails, multi-tenant agent model, audit/replay,
-metrics, TLS deployment, MCP interface.
+**evidence-aware post-change verification**, metrics, TLS deployment, MCP interface.
 
 **Bug-status reconciliation (2026-09-18, verified against the current code):**
 - *"`intent.py` has an `or True` bug"* — **not present.** `grep` for `or True` /
@@ -549,9 +626,6 @@ metrics, TLS deployment, MCP interface.
 Obvious next candidates (not yet built):
 - Batfish-class features at depth (e.g. realistic firewall/NAT interaction
   beyond the current scoping).
-- Full **validation** "proof bundle" JSON export for external audit (partial
-  delivery exists: the target-intelligence bundle + per-verdict `/export`
-  serve this cut).
 - More router dialects / vendors in `parse_router_text`.
 - Automated CI (git repo initialized 2026-09-18; no CI added yet) and
   packaging (PyPI / OCI).
@@ -564,6 +638,112 @@ frontend/architecture split; then propose the single highest-value next feature.
 ---
 
 ## 14. Changelog (updated after every change)
+
+- **2026-09-19** — **Evidence-aware post-change verification (v0.3.0).** Verdicts
+  can now be verified *after* the change is actually deployed on the live
+  network, against real observed evidence — never by trusting the dry-run pass:
+  - **Engine** (`backend/engine/postchange.py`): verification status machine
+    (`not_started` → `awaiting_observation` → `verified` /
+    `verified_with_warnings` / `mismatch` / `failed` / `inconclusive` /
+    `unsupported`), evidence documents redacted at rest + per-section source
+    precedence resolved by freshness, and a prediction rebuilt from the
+    *persisted report* (never a fresh simulation) with expected-present/
+    expected-absent deltas per section. The comparison emits health checks
+    (pass/warn/fail per predicted delta), mismatches grouped by root cause,
+    unexpected unrelated changes, and a rollback recommendation (inverse change
+    emitted as a replayable JSON backout when derivable from the retained
+    pre-change baseline; vendor commands are **never** generated). An observed
+    layer that is missing or unverifiable from evidence is treated as a failure
+    (`unsupported` + explanatory edge cases), and a dry-run pass never overrides
+    a post-change mismatch.
+  - **REST** (`backend/main.py`): `POST /api/validate` now returns an additive
+    `prediction` block so callers can compare predicted vs observed; new
+    `POST /api/verifications`, `GET /api/verifications/{vid}`,
+    `POST /api/verifications/{vid}/evidence`, `POST /api/verifications/{vid}/run`
+    (read-only health checks) and `GET /api/verifications/{vid}/bundle`
+    (exportable redacted artifact). All rate-limited and RBAC-scoped like the
+    rest of the API.
+  - **Dashboard** (`web/app.js` + `index.html` + `styles.css`): "Post-change
+    verify" tab on any persisted verdict — 5-step lifecycle, evidence JSON
+    editor prefilled with the predicted state (engineer edits it to match
+    reality), run button held disabled until evidence is stored (a run with no
+    evidence is meaningless), status badge, mismatch cards, health-check list,
+    coverage/freshness, rollback card, and a diagnostic-bundle download.
+    Cache-buster bumped to `app.js?v=0.9.1`. A real UI bug (run button gated on
+    a result that only a run could create — permanently disabled) was found and
+    fixed by the harness.
+  - **Verification:** backend suite **207 passed** (159 baseline + 36
+    `test_postchange.py` + 12 `test_verifications_api.py`); jsdom harness vs a
+    live server **34/34** covering boot, glossary, mode toggle, walkthrough,
+    risk dialog, the full result renderers, the verification view end-to-end
+    (open → sample evidence → save → run → terminal status + health checks +
+    rollback card + enabled bundle link → failed-path where the absent expected
+    change fails and recommends rollback) and bundle export. Sections 5/6/7/10/11/13
+    refreshed.
+
+- **2026-09-19** — **Per-change correctness sweep + live-home-network check.**
+  Exercised every preset (7 data-plane + 6 control-plane) and every builder
+  change type (`add/remove/replace_filter_rule`, `add/remove_route`,
+  `add/remove_dst_nat`, `add_bgp_peer`, `add_ospf_network`, `add_dns_record`,
+  `add_vlan_assignment`) over `/api/validate` and confirmed verdicts, pipeline
+  layers, checklist, trace, and path-node validity — all cleanup/planning
+  changes pass, policy-breaking presets block, route removal warns, and a
+  dst-nat on a port the policy still denies warns correctly. **Bugs found and
+  fixed:**
+  - `reach.py` anti-blackhole guard (private dst must never egress to the
+    uplink) had two defects: `ip in ip_network` raised `AttributeError` on
+    Python 3.12 (now `ipaddress.ip_address(ip) in net`), and it followed
+    *default* routes only, so LAN traffic that is genuinely delivered on a
+    connected segment was mis-flagged as a blackhole (every change warned with
+    "Requirement 'users-to-app' violated"). Rewritten as `_egresses_to_cloud`:
+    a longest-prefix-match walk toward the actual destination that reports a
+    blackhole only when the packet would really land at the internet cloud.
+    Now `remove_route` of the interior `/16` warns ("Route removal cuts the
+    path to …") via `_check_route_removal` in `validate.py`.
+  - Dotted lines (`app.js`): the engine's `path` records only devices that
+    forwarded/delivered, so a flow killed at an ingress filter (e.g.
+    `office-lan → internet` drop at the firewall) had a 1-node path and the red
+    line could not reach the blocking device. `_buildTopoFlows` now computes a
+    `journey` = path + drop device, used by `_drawPathLines` and
+    `_animateFlowPacket`; harness asserts the red dashed line reaches the
+    firewall.
+  - Live scan: `GET /api/model?mode=scan` on the user's home network
+    (router `192.168.31.1`, 6 hosts) validated a clean change in scan mode and
+    produced the full **source→destination matrix**: all 30 ordered device-IP
+    pairs resolve reachable through the router with valid path nodes, so every
+    pair gets a dotted line in the topology view.
+  - Verification: backend suite **159 passed**; jsdom harness **56/56**
+    (51 + 5 dotline/journey assertions).
+
+- **2026-09-19** — **Validation usefulness package (Phases 1–7).** The verdict
+  response became a machine-usable diagnostic payload instead of just
+  pass/block:
+  - **Phase 6 multi-layer pipeline** (`backend/engine/validate_pipeline.py` +
+    `drift.py`): SYNTAX → SEMANTIC → STATE → REACHABILITY, short-circuiting on
+    the first failing layer, each layer reporting `{layer, passed, duration_ms,
+    finding_count}` → `report["pipeline"]`; wired into `/api/validate`.
+  - **Phase 2 hop-by-hop trace** (`validate._trace_hops`): for every flow whose
+    status or reachability moved, the per-hop chain (device/iface/note + drop
+    filter/rule) → `report["trace"]`.
+  - **Phase 3 pre-change checklist** (`_build_checklist` + `KNOWN_CHANGE_TYPES`):
+    touched devices/filters and an honest blast-radius count of zone + policy
+    flows affected → `report["checklist"]`.
+  - **Phase 4 drift surfacing**: `drift.baseline_meta()` + pipeline
+    `_state_summary` → `report["drift"]`, plus a new `GET /api/drift` endpoint
+    (current model vs last approved baseline, risk level, per-section diffs).
+  - **Phase 5 diagnostic bundle**: `GET /api/verdicts/{vid}/bundle` assembles
+    provenance, environment, change, proposed diff, verdict, checklist, trace,
+    pipeline layers, drift, findings, matrix, requirements, flow summary,
+    control-plane checks, guardrails and inventory into one attachment.
+  - **Phase 7 dashboard UX** (`web/app.js` + `styles.css`): layer-progress bar
+    in the verdict card (pass/fail/skip cells with durations + early-stop note),
+    category-styled finding chips (critical/warning/info), a **Pre-change
+    checklist** tab and a **Hop-by-hop trace** tab (blocked hops pinned with the
+    exact filter/rule), a drift chip in the topology view, and a "Download
+    diagnostic bundle" link per verdict.
+  - Verification: backend suite **159 passed** (139 baseline + pipeline/trace/
+    checklist/diagnostics); jsdom harness **51/51** against the live server.
+  Sections 4/6/10/11/13 refreshed.
 
 - **2026-09-18** — **S4 static deployment review.** Statically verified the
   `Caddyfile` (site block, `reverse_proxy netproof:8000`), `Dockerfile`

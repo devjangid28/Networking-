@@ -3,9 +3,18 @@
 Thumbs.db
 *.local
 
+# Runtime logs (never commit)
+*.log
+server*.log
+server*.err.log
+nohup.out
+
 # Python caches (rebuilt automatically)
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Local Python environment (rebuilt by bootstrap.ps1 -> pip install)
 lib/venv/

@@ -341,6 +341,57 @@ class Requirement:
 
 
 @dataclass
+class Finding:
+    """A structured diagnostic message.
+
+    ``to_dict()`` serializes into the API/audit payload. The ``severity`` /
+    ``type`` / ``title`` / ``detail`` / ``before`` / ``after`` fields are the
+    legacy schema (kept so nothing downstream breaks); the remaining fields
+    turn a bare error into an engineer-actionable diagnosis: where it happened,
+    why, how impactful it is, what to do about it, and what convinced us.
+    """
+    severity: str  # critical / warning / info
+    type: str  # legacy type tag (requirement, connectivity_loss, ...)
+    title: str
+    detail: str
+    category: str = "semantic_error"  # syntax_error / semantic_error / policy_violation / reachability_impact / operational_risk / compliance_drift
+    why: str = ""
+    location: dict = field(default_factory=dict)  # {device, interface, config_section, config_line, change_type}
+    affected_flows: list = field(default_factory=list)
+    impact_score: int = 0  # 0-100
+    plain_english: str = ""
+    remediation: list = field(default_factory=list)
+    confidence: str = "high"  # high / medium / low
+    evidence: dict = field(default_factory=dict)
+    before: Optional[dict] = None
+    after: Optional[dict] = None
+    extra: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        out: dict = {
+            "severity": self.severity,
+            "type": self.type,
+            "title": self.title,
+            "detail": self.detail,
+            "category": self.category,
+            "why": self.why,
+            "location": self.location,
+            "affected_flows": self.affected_flows,
+            "impact_score": self.impact_score,
+            "plain_english": self.plain_english,
+            "remediation": self.remediation,
+            "confidence": self.confidence,
+            "evidence": self.evidence,
+        }
+        if self.before is not None:
+            out["before"] = self.before
+        if self.after is not None:
+            out["after"] = self.after
+        out.update(self.extra)  # legacy extras like requirement / port_forward
+        return out
+
+
+@dataclass
 class Link:
     dev_a: str
     iface_a: str

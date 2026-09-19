@@ -20,6 +20,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -61,6 +62,8 @@ from engine.model import load_net, Net
 from engine.events import init_events, log_event, list_events
 from engine.reach import apply_change
 from engine.validate import ALL_PRESETS, ENGINE_VERSION, PRESETS, validate_change
+from engine.validate_pipeline import run_validation_pipeline
+from engine.drift import baseline_meta, detect_drift
 import ratelimit
 from logfmt import setup_logging
 from metrics import note_request as metrics_note_request, note_scan as metrics_note_scan, note_verdict as metrics_note_verdict, render as render_metrics
@@ -351,6 +354,29 @@ class LoginRequest(BaseModel):
     username: str = Field("", description="Dashboard username ($NETPROOF_ADMIN_USER, or an org user)")
     password: str = Field("", description="Dashboard password ($NETPROOF_ADMIN_PASS, or the org user's password)")
     org_id: str = Field("", description="Account to log into when this is an org-scoped user. Empty for the global admin.")
+
+
+class VerificationCreateRequest(BaseModel):
+    """Open a post-change verification against a stored verdict."""
+    verdict_id: str = Field(..., description="A stored verdict id from the audit trail to verify against")
+    requester: str | None = Field(None, description="Who is driving this verification (human or agent name)")
+    source_precedence: list[str] | None = Field(
+        None, description="Evidence-source tie-break order, e.g. [\"snapshot\",\"agent_report\",\"probe\",\"manual\"]")
+    pre_change_evidence: dict | None = Field(
+        None, description="Optional pre-change snapshot for before-values and device mapping: "
+                          "{devices: {name: ip-or-[ips]}, config: {ip: {filters,routes,dst_nat,bgp,ospf,dns,vlan_assignment}}}")
+
+
+class VerificationRunRequest(BaseModel):
+    """Run the comparison, health checks and rollback in one call."""
+    source_precedence: list[str] | None = Field(None, description="Optional evidence-source tie-break order")
+
+
+class EvidenceAddRequest(BaseModel):
+    """Post-change evidence documents collected from the live network."""
+    evidence: list[dict] = Field(
+        ..., description="Evidence documents: "
+                         "{source, device, section, content, collected_at, confirmed, errors?, unsupported?}")
 
 
 def _require_org_scope(request: Request, org: str) -> dict:
@@ -1012,7 +1038,8 @@ def validate(req: ChangeRequest, request: Request = None) -> dict:
             require_session(request)
     net = _model_for_mode(req.mode, req.account)
     try:
-        report = validate_change(net, req.change)
+        report = run_validation_pipeline(req.change, net,
+                                         org_id=(req.account if req.mode == "agent" else ""))["report"]
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -1052,8 +1079,15 @@ def validate(req: ChangeRequest, request: Request = None) -> dict:
         "change_fingerprint": prov["change_fingerprint"],
         "replay_endpoint": f"/api/verdicts/{vid}/replay",
         "export_endpoint": f"/api/verdicts/{vid}/export",
+        "verification_endpoint": "/api/verifications",
         "replayed_deterministic": True,
     }
+
+    try:
+        from engine import postchange as _postchange
+        report["prediction"] = _postchange.build_prediction(report, None)
+    except Exception as _exc:  # additive; must never break validation
+        report["prediction"] = {"available": False, "reason": str(_exc)}
     return report
 
 
@@ -1092,6 +1126,39 @@ def guardrails(req: GuardrailRequest, request: Request = None) -> dict:
     net = _model_for_mode(req.mode, req.account)
     checks = check_change(req.change, net=net, org=req.org)
     return {"org": req.org, "pass": not guardrail_blocked(checks), "hard_block": guardrail_blocked(checks), "checks": checks}
+
+
+@app.get("/api/drift")
+def drift_status(mode: str = "demo", org: str = "", request: Request = None) -> dict:
+    """Current model vs. the last approved baseline for this network (Phase 4).
+
+    Independently of any specific change, this tells an engineer whether the
+    running model quietly drifted off what was last signed off - and how risky
+    each moved section is.
+    """
+    if request and mode != "demo":
+        if org:
+            _require_org_scope(request, org)
+        else:
+            require_session(request)
+    net = _model_for_mode(mode, org)
+    org_id = org or None
+    baseline, baseline_at = baseline_meta(net, org_id)
+    results = detect_drift(net, baseline, org_id)
+    lead = results[0] if results else None
+    return {
+        "network": net.name,
+        "baseline_exists": baseline is not None,
+        "baseline_at": baseline_at,
+        "drift_count": len(results) - 1 if results else 0,
+        "risk_level": (lead.details.get("risk_level") or "none") if lead else "none",
+        "suggested_action": lead.suggested_action if lead else None,
+        "results": [
+            {"drift_type": r.drift_type, "details": r.details,
+             "affected_flows": r.affected_flows, "suggested_action": r.suggested_action}
+            for r in results
+        ],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -1205,6 +1272,76 @@ def verdict_export(vid: str, info: dict = Depends(require_session)):
     )
 
 
+@app.get("/api/verdicts/{vid}/bundle")
+def verdict_bundle(vid: str, info: dict = Depends(require_session)):
+    """Full diagnostic bundle (Phase 5): everything a support engineer needs in
+    one file - verdict, findings, hop-by-hop traces, checklist, pipeline layers,
+    drift, diff, guardrails, and the model inventory at validation time."""
+    stored = get_verdict(vid)
+    if stored is None:
+        raise HTTPException(status_code=404, detail=f"no verdict '{vid}' in the audit trail")
+    _verdict_visible(info, stored)
+    net = _net_for_hash(stored["model_hash"])
+    if net is None:
+        raise HTTPException(status_code=409, detail="the baseline snapshot for this verdict is not loaded")
+    try:
+        net_after = apply_change(net, stored["raw_change"])
+        proposed_diff = unified_diff(net, net_after)
+    except ValueError:
+        proposed_diff = ""
+    report = stored["report"]
+    bundle = {
+        "bundle_spec": "netproof/diagnostic/v1",
+        "exported_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "app": "NetProof",
+        "verdict_id": vid,
+        "provenance": {
+            "engine": "netproof",
+            "engine_version": stored["engine_version"],
+            "network": stored["model_name"],
+            "model_hash": stored["model_hash"],
+            "requester": stored["requester"],
+            "created_at": stored["created_at"],
+            "change_fingerprint": stored["change_fingerprint"],
+        },
+        "environment": {
+            "model_source": stored.get("model_source") or "unknown",
+            "python": sys.version.split()[0],
+            "platform": sys.platform,
+        },
+        "change": json.loads(stored["raw_change"]) if isinstance(stored["raw_change"], str) else stored["raw_change"],
+        "proposed_diff": proposed_diff,
+        "verdict": report.get("summary"),
+        "checklist": report.get("checklist") or [],
+        "trace": report.get("trace") or [],
+        "pipeline_layers": (report.get("pipeline") or {}).get("layers") or [],
+        "drift": report.get("drift"),
+        "findings": report.get("findings") or [],
+        "matrix": report.get("matrix"),
+        "requirements": report.get("requirements") or [],
+        "flow_summary": {"before": report.get("before"), "after": report.get("after")},
+        "control_plane": report.get("control_plane"),
+        "guardrails": stored.get("guardrails"),
+        "inventory": {
+            "devices": sorted(({
+                "name": d.name, "type": d.dtype,
+                "interfaces": sorted(i.name for i in d.interfaces),
+                "routes": [{"network": r.network, "next_hop": r.next_hop} for r in d.routes],
+            } for d in net.devices.values()), key=lambda x: x["name"]),
+            "filters": sorted(({
+                "name": f.name, "default": f.default, "stateful": f.stateful,
+                "rules": [{"action": r.action, "src": r.src, "dst": r.dst,
+                           "proto": r.proto, "dport": str(r.dport)} for r in f.rules],
+            } for f in net.filters.values()), key=lambda x: x["name"]),
+        },
+    }
+    fname = f"netproof-bundle-{vid}.json"
+    return JSONResponse(
+        content=bundle,
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
 @app.get("/api/verdicts/{vid}/diff")
 def verdict_diff(vid: str, info: dict = Depends(require_session)) -> PlainTextResponse:
     """Unified-diff of the proposed config change (rendered from the model)."""
@@ -1217,6 +1354,123 @@ def verdict_diff(vid: str, info: dict = Depends(require_session)) -> PlainTextRe
         raise HTTPException(status_code=409, detail="the baseline snapshot for this verdict is not loaded")
     net_after = apply_change(net, stored["raw_change"])
     return PlainTextResponse(unified_diff(net, net_after), media_type="text/plain")
+
+
+def _verification_visible(info: dict, stored: dict) -> None:
+    """403 for an org-scoped session trying to reach another account's verification."""
+    if info.get("org_id") and stored.get("org_id") != info.get("org_id"):
+        raise HTTPException(status_code=403, detail="access to this verification is not allowed for your account")
+
+
+@app.post("/api/verifications")
+def create_verification(req: VerificationCreateRequest, request: Request = None,
+                        info: dict = Depends(require_role)) -> dict:
+    """Open a post-change verification for a stored verdict (Phase 6).
+
+    Builds the evidence-aware prediction from the persisted report (never from a
+    live simulation) and stores the verification in the ``not_started`` state.
+    """
+    if request and not ratelimit.allow(request, "verifications", 60, 60):
+        raise HTTPException(status_code=429, detail="verifications rate limit: 60 per minute")
+    stored = get_verdict(req.verdict_id)
+    if stored is None or not (stored.get("report") or {}):
+        raise HTTPException(status_code=404, detail=f"no verdict '{req.verdict_id}' with a stored report in the audit trail")
+    _verdict_visible(info, stored)
+
+    from engine import postchange as _postchange
+    prediction = _postchange.build_prediction(
+        stored["report"], req.pre_change_evidence)
+    org_id = info.get("org_id") or stored.get("org_id") or "default"
+    verification = _postchange.create_verification(
+        verdict_id=req.verdict_id,
+        org_id=org_id,
+        requester=req.requester or info.get("username"),
+        change=(stored.get("raw_change") if isinstance(stored.get("raw_change"), dict)
+                else json.loads(stored.get("raw_change") or "{}")),
+        source_precedence=req.source_precedence,
+        prediction=prediction,
+    )
+    log_event("verification", actor=info.get("username"), target=verification["id"],
+              detail={"action": "create", "verdict_id": req.verdict_id,
+                      "status": verification["status"], "change": (verification.get("change") or {}).get("type")},
+              ip=(request.client.host if request and request.client else None))
+    return verification
+
+
+@app.get("/api/verifications/{vid}")
+def verification(vid: str, info: dict = Depends(require_session)) -> dict:
+    from engine import postchange as _postchange
+    stored = _postchange.get_verification(vid)
+    if stored is None:
+        raise HTTPException(status_code=404, detail=f"no verification '{vid}'")
+    _verification_visible(info, stored)
+    return stored
+
+
+@app.post("/api/verifications/{vid}/evidence")
+def verification_evidence(vid: str, req: EvidenceAddRequest, request: Request = None,
+                          info: dict = Depends(require_role)) -> dict:
+    """Append post-change evidence documents (redacted at rest) to a verification."""
+    if request and not ratelimit.allow(request, "verifications", 120, 60):
+        raise HTTPException(status_code=429, detail="verifications rate limit: 120 per minute")
+    from engine import postchange as _postchange
+    stored = _postchange.get_verification(vid)
+    if stored is None:
+        raise HTTPException(status_code=404, detail=f"no verification '{vid}'")
+    _verification_visible(info, stored)
+    try:
+        updated = _postchange.add_evidence(vid, req.evidence)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    log_event("verification", actor=info.get("username"), target=vid,
+              detail={"action": "add_evidence", "documents": len(req.evidence),
+                      "status": updated["status"]},
+              ip=(request.client.host if request and request.client else None))
+    return updated
+
+
+@app.post("/api/verifications/{vid}/run")
+def verification_run(vid: str, req: VerificationRunRequest = None, request: Request = None,
+                     info: dict = Depends(require_role)) -> dict:
+    """Run comparison + read-only health checks + rollback recommendation."""
+    if request and not ratelimit.allow(request, "verifications", 30, 60):
+        raise HTTPException(status_code=429, detail="verifications rate limit: 30 per minute")
+    from engine import postchange as _postchange
+    stored = _postchange.get_verification(vid)
+    if stored is None:
+        raise HTTPException(status_code=404, detail=f"no verification '{vid}'")
+    _verification_visible(info, stored)
+    precedence = list((req or VerificationRunRequest()).source_precedence or [])
+    if not precedence and stored.get("source_precedence"):
+        precedence = list(stored["source_precedence"] or [])
+    try:
+        out = _postchange.run_verification(vid, source_precedence=precedence or None)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    log_event("verification", actor=info.get("username"), target=vid,
+              detail={"action": "run", "status": out["status"],
+                      "mismatches": len((out.get("result") or {}).get("mismatches") or [])},
+              ip=(request.client.host if request and request.client else None))
+    return out
+
+
+@app.get("/api/verifications/{vid}/bundle")
+def verification_bundle(vid: str, info: dict = Depends(require_session)):
+    """Exportable verification bundle: prediction, evidence, result, health
+    checks, rollback and the source verdict summary (secrets always redacted)."""
+    from engine import postchange as _postchange
+    stored = _postchange.get_verification(vid)
+    if stored is None:
+        raise HTTPException(status_code=404, detail=f"no verification '{vid}'")
+    _verification_visible(info, stored)
+    bundle = stored.get("bundle")
+    if bundle is None:
+        raise HTTPException(status_code=409, detail="run the verification before exporting its bundle")
+    fname = f"netproof-verification-{vid}.json"
+    return JSONResponse(
+        content=bundle,
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 def _provenance(mode: str, net: Net, change: dict, requester: str | None = None) -> dict:

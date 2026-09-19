@@ -2426,9 +2426,11 @@ function renderResult(report) {
         <span class="mono dim">${s.blocked} critical · ${s.warnings} warnings · ${s.info} info</span></div>
       ${report.summary.guardrail_block ? `<p class="verdict-sub" style="color:var(--danger);font-weight:600">Guardrail override — engine verdict <span class="mono">${esc(report.summary.engine_verdict || "?")}</span> (${report.summary.engine_score ?? "?"} trust) was overridden to block by policy guardrails.</p>` : ""}
       <p class="verdict-sub">${esc(describeChange(report.change))} — verified over <span class="mono">${s.flows_checked}</span> flows.</p>
-      <p class="verdict-sub">${esc(describeChange(report.change))} — verified over <span class="mono">${s.flows_checked}</span> flows.</p>
     </div>`;
   box.appendChild(hero);
+
+  const pl = renderPipelineBar(report);
+  if (pl) box.appendChild(pl);
 
   const plain = document.createElement("div");
   plain.className = "verdict-plain";
@@ -2459,6 +2461,7 @@ function renderResult(report) {
   guards.id = "guard-chips";
   guards.innerHTML = `<span class="guard-chip pass">policy pre-flight · no guardrails tripped</span>`;
   box.appendChild(guards);
+  renderDriftChip(report, guards);
 
   const tabs = document.createElement("div");
   tabs.className = "result-tabs";
@@ -2467,6 +2470,19 @@ function renderResult(report) {
   const tM = document.createElement("button"); tM.className = "tab"; tM.dataset.tab = "matrix"; tM.setAttribute("data-gloss", "zone");
   tM.innerHTML = `Zone reachability<span class="cnt">${Object.keys(report.matrix).length}</span>`;
   tabs.appendChild(tF); tabs.appendChild(tM);
+  const tC = document.createElement("button"); tC.className = "tab"; tC.dataset.tab = "checklist";
+  const badChecks = (report.checklist || []).filter((c) => c.status !== "ok" && c.status !== "info").length;
+  tC.innerHTML = `Pre-change checklist<span class="cnt">${badChecks ? badChecks + "!" : "✓"}</span>`;
+  tabs.appendChild(tC);
+  const tT = document.createElement("button"); tT.className = "tab"; tT.dataset.tab = "trace";
+  tT.innerHTML = `Hop-by-hop trace<span class="cnt">${(report.trace || []).length}</span>`;
+  tabs.appendChild(tT);
+  if (report.audit && report.audit.verdict_id) {
+    const tV = document.createElement("button"); tV.className = "tab"; tV.dataset.tab = "verify";
+    tV.title = "Compare the real post-change state against the approved prediction";
+    tV.innerHTML = `Post-change verify`;
+    tabs.appendChild(tV);
+  }
   if (report.proposed_diff) {
     const tD = document.createElement("button"); tD.className = "tab"; tD.dataset.tab = "diff";
     tD.innerHTML = `Diff`;
@@ -2480,7 +2496,11 @@ function renderResult(report) {
   const rM = renderMatrix(report);
   const rR = renderReplay(report);
   const rD = renderDiff(report);
-  body.appendChild(rF); body.appendChild(rM); body.appendChild(rR);
+  const rC = renderChecklist(report.checklist || []);
+  const rT = renderTrace(report.trace || []);
+  const rV = renderVerifyTab(report);
+  body.appendChild(rF); body.appendChild(rM); body.appendChild(rR); body.appendChild(rC); body.appendChild(rT);
+  body.appendChild(rV);
   if (rD) body.appendChild(rD);
   box.appendChild(body);
 
@@ -2503,6 +2523,13 @@ function renderResult(report) {
     expLink.className = "btn btn-secondary";
     expLink.style.cssText = "padding:4px 12px;font-size:11px;text-decoration:none;margin-left:8px";
     box.appendChild(expLink);
+
+    const bundleLink = document.createElement("a");
+    bundleLink.href = aud.export_endpoint.replace(/\/export$/, "/bundle");
+    bundleLink.textContent = "Download diagnostic bundle";
+    bundleLink.className = "btn btn-secondary";
+    bundleLink.style.cssText = "padding:4px 12px;font-size:11px;text-decoration:none;margin-left:8px";
+    box.appendChild(bundleLink);
   }
   if (aud.replay_endpoint) {
     const repLink = document.createElement("a");
@@ -2564,6 +2591,435 @@ function renderGuardrails(checks) {
   ).join("");
 }
 
+function renderDriftChip(report, chipRow) {
+  const d = report.drift;
+  if (!d || !d.has_drift) return;
+  const tag = d.risk_level === "critical" || d.risk_level === "high" ? "critical" : "warning";
+  const el = document.createElement("span");
+  el.className = `guard-chip drift ${tag}`;
+  el.title = d.suggested_action || "";
+  el.textContent = `config drift · ${d.diff_count ?? "?"} sections off baseline (${d.risk_level})`;
+  chipRow.appendChild(el);
+}
+
+function renderPipelineBar(report) {
+  const pl = report.pipeline;
+  if (!pl || !pl.layers || !pl.layers.length) return null;
+  const wrap = document.createElement("div");
+  wrap.className = "layer-bar";
+  const label = "validation pipeline";
+  let html = `<div class="layer-bar-label">${label}</div><div class="layer-bar-track">`;
+  const stopped = report.summary.stopped_before_reachability;
+  pl.layers.forEach((l, i) => {
+    const firstFailed = pl.layers.findIndex((x) => !x.passed);
+    const skipped = firstFailed >= 0 && i > firstFailed;
+    const cls = skipped ? "skip" : l.passed ? "pass" : "fail";
+    const nm = l.layer;
+    const cnt = l.finding_count || 0;
+    const tip = `${nm} layer · ${l.passed ? "passed" : "blocked"} · ${cnt} finding${cnt === 1 ? "" : "s"} · ${l.duration_ms ?? "?"}ms${skipped ? " · skipped after early stop" : ""}`;
+    html += `<div class="layer-cell ${cls}" title="${esc(tip)}"><span class="ic">${l.passed ? "✓" : skipped ? "·" : "✗"}</span><span class="nm">${nm}</span><span class="ms">${(l.duration_ms ?? 0).toFixed ? l.duration_ms.toFixed(0) + "ms" : ""}</span></div>`;
+  });
+  html += `</div>`;
+  if (stopped) html += `<div class="layer-bar-note">Sequential validation stopped early — later layers were not reached.</div>`;
+  wrap.innerHTML = html;
+  return wrap;
+}
+
+function renderChecklist(checklist) {
+  const wrap = document.createElement("div");
+  wrap.className = "tab-zone checklist"; wrap.dataset.zone = "checklist";
+  if (!checklist || !checklist.length) {
+    wrap.innerHTML = `<div class="verdict-sub" style="padding:8px 2px">No checklist produced.</div>`;
+    return wrap;
+  }
+  const glyph = { ok: "✓", warn: "!", fail: "✗", info: "i" };
+  wrap.innerHTML = checklist.map((c) => `
+    <div class="check-item ${c.status}">
+      <span class="ck-glyph">${glyph[c.status] || "•"}</span>
+      <div class="ck-body"><b>${esc(c.label)}</b>${c.detail ? `<div class="dim">${esc(c.detail)}</div>` : ""}</div>
+    </div>`).join("");
+  return wrap;
+}
+
+function renderTrace(trace) {
+  const wrap = document.createElement("div");
+  wrap.className = "tab-zone trace"; wrap.dataset.zone = "trace";
+  if (!trace || !trace.length) {
+    wrap.innerHTML = `<div class="verdict-sub" style="padding:8px 2px">No flow changed behavior — nothing to trace hop by hop.</div>`;
+    return wrap;
+  }
+  const block = trace.filter((t) => !t.after.reachable);
+  let cards = "";
+  trace.forEach((t, i) => {
+    const fate = t.after.reachable ? "reachable" : (t.after.status || "blocked");
+    const dropLine = (!t.after.reachable && t.drop)
+      ? (t.drop.filter
+        ? `<div class="drop-line">BLOCKED by ${esc(t.drop.filter)}${t.drop.rule ? " (rule: " + esc(t.drop.rule) + ")" : ""} on ${esc(t.drop.device || "?")}${t.drop.iface ? "/" + esc(t.drop.iface) : ""}</div>`
+        : `<div class="drop-line">STOPPED — ${esc(t.drop.detail || t.after.status)}</div>`) : "";
+    const hops = (t.hops || []).map((h) => `
+      <div class="trace-hop" title="${esc(h.iface || "")}">
+        <span class="tap">${h.order}</span>
+        <span class="tdev">${esc(h.device || "?")}${h.iface ? `<span class="dim">/${esc(h.iface)}</span>` : ""}</span>
+        <span class="tnote dim">${esc(h.note || "")}</span>
+      </div>`).join("");
+    const nat = t.nat ? `<div class="mono dim" style="font-size:10.5px;margin-top:4px">${esc(t.nat.old_dst ? "DST-NAT " + t.nat.old_dst + " → " + t.nat.new_dst : "NAT applied")}</div>` : "";
+    cards += `<div class="trace-card ${t.after.reachable ? "" : "bad"}">
+      <div class="trace-head"><span class="verdict-tag mono">${esc(t.flow.label || (t.flow.src + " → " + t.flow.dst))}</span>
+        <span class="dim mono">${esc(t.flow.src)} → ${esc(t.flow.dst)} · ${esc(t.flow.proto)}${t.flow.dport && t.flow.dport !== "any" ? "/" + esc(t.flow.dport) : ""}</span>
+        <span class="verdict-sub mono" style="margin-left:auto">before: <b>${esc(t.before.status)}</b> → after: <b class="${t.after.reachable ? "" : "bad"}">${esc(fate)}</b></span></div>
+      <div class="trace-hops">${hops}</div>
+      ${dropLine}${nat}
+      <div class="trace-path dim mono">path: ${esc((t.path || []).join(" → ") || "—")}</div>
+    </div>`;
+  });
+  const summary = block.length ? `<div class="verdict-sub" style="padding:6px 2px;color:var(--danger)">${block.length} flow${block.length > 1 ? "s" : ""} blocked by this change — check the drop line at the last hop.</div>` : "";
+  wrap.innerHTML = summary + cards;
+  return wrap;
+}
+
+/* ============================================================
+   Post-change verification view (evidence-aware lifecycle)
+   ============================================================ */
+
+const VERIF_BY_VID = {};
+const VERIF_SAMPLE_DOCS = 4; // cap of documents inserted from "Insert sample"
+
+function vfNow() {
+  return new Date().toISOString().replace(/\.\d+Z$/, "Z");
+}
+
+function vfStatusLabel(st) {
+  return ({
+    not_started: "Not started",
+    awaiting_observation: "Awaiting post-change evidence",
+    verified: "Verified",
+    verified_with_warnings: "Verified with warnings",
+    mismatch: "Mismatch",
+    failed: "Failed",
+    inconclusive: "Inconclusive",
+    unsupported: "Unsupported",
+  }[st] || st || "Unknown");
+}
+
+function vfSeverityClass(s) { return s === "critical" ? "critical" : s === "warning" ? "warning" : "info"; }
+
+function ruleToRaw(r) {
+  const out = { action: r.action, src: r.src, dst: r.dst, proto: r.proto };
+  if (r.dport && r.dport !== "any" && r.dport !== "0") out.dport = r.dport;
+  return out;
+}
+
+/* Pre-change evidence in the engine's config-snapshot shape, built from the
+   current model — gives the prediction before-values and a baseline for
+   detecting unrelated post-change edits. */
+function buildPreChangeEvidence() {
+  const net = model();
+  const devices = {}, config = {};
+  (net.devices || []).forEach((dev) => {
+    const ip = mainIp(dev);
+    if (!ip) return;
+    devices[dev.name] = ip;
+    const conf = {};
+    const fs = {};
+    (dev.interfaces || []).forEach((i) => {
+      (i.filters || []).forEach((fname) => {
+        const f = (net.filters || []).find((x) => x.name === fname);
+        if (!f) return;
+        fs[fname] = { default: f.default, stateful: !!f.stateful, rules: (f.rules || []).map(ruleToRaw) };
+      });
+    });
+    if (Object.keys(fs).length) conf.filters = fs;
+    const routes = (dev.routes || []).filter((r) => r.network).map((r) => ({ network: r.network, next_hop: r.next_hop }));
+    if (routes.length) conf.routes = routes;
+    if (Object.keys(conf).length) config[ip] = conf;
+  });
+  return { devices, config };
+}
+
+/* Post-change evidence template: the predicted state, per changed section.
+   The engineer edits this to the REAL observed config before running. */
+function sampleEvidence(report) {
+  const pred = report.prediction || {};
+  const docs = [];
+  const byKey = {};
+  (pred.deltas || []).forEach((d) => {
+    if (d.advisory || !d.section) return;
+    if (d.kind === "control_plane") return;
+    let fname = "";
+    if (d.kind === "filter_rule") fname = String(d.key || "").replace(/^filter_rule:/, "").split(":")[0];
+    const key = [d.section, d.device || "", fname].join("|");
+    const g = byKey[key] || (byKey[key] = { section: d.section, device: d.device || "", fname, items: [] });
+    if (d.expected_present && d.expected != null) g.items.push(d.expected);
+  });
+  Object.keys(byKey).forEach((k, i) => {
+    const g = byKey[k];
+    const doc = { source: "snapshot", section: g.section, collected_at: vfNow(), confirmed: true };
+    if (g.device) doc.device = g.device;
+    if (g.section === "filters") {
+      const fc = { filters: {} };
+      fc.filters[g.fname || (report.change && report.change.filter) || "filter"] = { rules: g.items };
+      doc.content = fc;
+    } else {
+      const c = {};
+      c[g.section] = g.items;
+      doc.content = c;
+    }
+    docs.push(doc);
+  });
+  return docs;
+}
+
+async function vfCreate(report) {
+  const vid = report.audit && report.audit.verdict_id;
+  const res = await fetch("/api/verifications", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      verdict_id: vid,
+      requester: window.__authUser || "",
+      pre_change_evidence: buildPreChangeEvidence(),
+    }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "open verification failed");
+  const v = await res.json();
+  VERIF_BY_VID[vid] = v;
+  return v;
+}
+
+async function vfAddEvidence(report, v) {
+  const vid = report.audit && report.audit.verdict_id;
+  const ta = document.getElementById("vf-evidence-editor-" + vid);
+  let evidence;
+  try {
+    evidence = JSON.parse(ta ? ta.value : "[]");
+  } catch (e) { toast("Evidence is not valid JSON: " + e.message, true); return null; }
+  if (!Array.isArray(evidence)) { toast("Evidence must be a JSON array of documents.", true); return null; }
+  const res = await fetch("/api/verifications/" + v.id + "/evidence", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ evidence }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "adding evidence failed");
+  const updated = await res.json();
+  VERIF_BY_VID[vid] = updated;
+  return updated;
+}
+
+async function vfRun(report, v) {
+  const vid = report.audit && report.audit.verdict_id;
+  const res = await fetch("/api/verifications/" + v.id + "/run", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "running verification failed");
+  const out = await res.json();
+  VERIF_BY_VID[vid] = out;
+  return out;
+}
+
+function renderVerifiedBadge(st) {
+  const cls = st === "verified" ? "pass" : st === "verified_with_warnings" ? "warn"
+    : (st === "mismatch" || st === "failed" || st === "unsupported") ? "fail"
+    : st === "inconclusive" ? "warn" : "idle";
+  return `<span class="vf-status ${cls}">${esc(vfStatusLabel(st))}</span>`;
+}
+
+function vfHealthRows(checks) {
+  if (!checks || !checks.length) return `<div class="vf-empty">No health checks recorded.</div>`;
+  const glyph = { pass: "✓", warn: "!", fail: "✗", unknown: "?" };
+  return checks.map((h) => `
+    <div class="vf-hc ${h.status}"><span class="hf-glyph">${glyph[h.status] || "•"}</span>
+      <div class="hf-body"><b>${esc(h.id)}</b>
+        <div class="dim">expected: ${esc(h.expected)} · observed: ${esc(h.observed)}</div>
+        <div class="dim">${esc(h.explanation)}${h.evidence_ids && h.evidence_ids.length ? " · evidence " + h.evidence_ids.map((e) => esc(e).slice(0, 8)).join(", ") : ""} · confidence ${h.confidence ?? "?"}</div>
+      </div></div>`).join("");
+}
+
+function vfMismatchRows(mismatches) {
+  if (!mismatches || !mismatches.length) return "";
+  return mismatches.map((m) => `
+    <div class="vf-mm ${vfSeverityClass(m.severity)}">
+      <div class="mm-head"><span class="mm-sev ${vfSeverityClass(m.severity)}">${esc(m.severity || "info")}</span>
+        <b>${esc(m.label || m.key || "mismatch")}</b>
+        <span class="mono dim">${esc(m.kind || m.status || "")}</span></div>
+      <div class="mm-detail">${esc(m.detail || "")}</div>
+      <div class="mm-cols">
+        <div class="mm-col"><h4>Expected</h4><pre>${esc(JSON.stringify(m.expected ?? null, null, 2))}</pre></div>
+        <div class="mm-col"><h4>Observed</h4><pre>${esc(JSON.stringify(m.observed ?? null, null, 2))}</pre></div>
+      </div>
+      ${m.evidence_ids && m.evidence_ids.length ? `<div class="dim mono mm-ev">evidence: ${m.evidence_ids.map((e) => esc(e)).join(" · ")}</div>` : ""}
+    </div>`).join("");
+}
+
+function vfUnexpectedRows(unexpected) {
+  if (!unexpected || !unexpected.length) return "";
+  return unexpected.map((u) => `
+    <div class="vf-unexpected"><span class="mm-sev warning">unexpected</span>
+      <span class="dim">${esc(u.status || "")}</span>
+      <pre>${esc(JSON.stringify(u.observed ?? null, null, 2))}</pre>
+      <div class="dim">${esc(u.detail || "")}</div></div>`).join("");
+}
+
+function vfRollbackCard(rb) {
+  if (!rb) return "";
+  const triggers = (rb.triggers || []).map((t) =>
+    `<li><b>${esc(t.title)}</b> — ${esc(t.detail || "")}${t.evidence_ids && t.evidence_ids.length ? ` <span class="mono dim">[${t.evidence_ids.join(", ")}]</span>` : ""}</li>`).join("");
+  const inv = rb.inverse_change ? `<pre>${esc(JSON.stringify(rb.inverse_change, null, 2))}</pre>` : `<div class="vf-empty">No safely derivable inverse change (missing pre-change value).</div>`;
+  return `<div class="vf-rollback ${rb.recommended ? "recommended" : "ok"}">
+    <div class="rb-head">${rb.recommended ? "⚠ Rollback recommended — human approval required" : "No rollback recommended"}
+      <span class="mono dim">${esc(rb.reason || "")}</span></div>
+    ${triggers ? `<div class="rb-sec"><h4>Trigger condition(s)</h4><ul>${triggers}</ul></div>` : ""}
+    ${rb.affected_systems && rb.affected_systems.length ? `<div class="rb-sec"><h4>Affected systems</h4><div class="vf-chips">${rb.affected_systems.map((a) => `<span class="vf-chip">${esc(a)}</span>`).join("")}</div></div>` : ""}
+    <div class="rb-sec"><h4>Inverse / backout change (replayable, never auto-executed)</h4>${inv}</div>
+    <div class="rb-sec"><h4>Warnings</h4><div class="dim">${(rb.warnings || []).map((w) => "· " + esc(w)).join("<br>") || "none"}</div></div>
+    <div class="rb-sec dim">Vendor commands: never generated · post-rollback verification required: ${rb.requires_post_rollback_verification ? "yes" : "no"}</div>
+  </div>`;
+}
+
+function vfCoverage(coverage) {
+  if (!coverage) return "";
+  const rows = Object.keys(coverage).map((sec) => {
+    const g = coverage[sec];
+    return `<div class="vf-cov"><span>${esc(sec)}</span><span class="mono dim">${g.sources.join(", ")}${g.stale ? " · STALE" : ""}</span></div>`;
+  }).join("");
+  return rows;
+}
+
+/* Renders the whole "Post-change verify" tab zone for a report. */
+function renderVerifyTab(report) {
+  const wrap = document.createElement("div");
+  wrap.className = "tab-zone verify"; wrap.dataset.zone = "verify";
+  const vid = report.audit && report.audit.verdict_id;
+  if (!vid) {
+    wrap.innerHTML = `<div class="verdict-sub" style="padding:8px 2px">This report was not persisted to the audit trail, so it cannot be verified post-change.</div>`;
+    return wrap;
+  }
+  const holder = document.createElement("div");
+  holder.id = "verify-zone-" + vid;
+  wrap.appendChild(holder);
+  holder.innerHTML = `<div class="verdict-sub" style="padding:8px 2px">Loading verification…</div>`;
+  const existing = VERIF_BY_VID[vid];
+  if (existing) {
+    vfRenderInto(report, existing, holder);
+  } else {
+    holder.innerHTML = `
+      <div class="vf-intro">
+        <div class="vf-life">
+          <div class="vf-step done"><i>1</i><b>Capture pre-change evidence</b><span class="dim">baseline from the model window</span></div>
+          <div class="vf-step done"><i>2</i><b>Dry-run prediction</b><span class="mono dim">${(report.prediction || {}).deltas ? report.prediction.deltas.length : "—"} deltas · ${esc(report.summary.verdict)}</span></div>
+          <div class="vf-step"><i>3</i><b>Deploy the change</b><span class="dim">real network, outside NetProof</span></div>
+          <div class="vf-step"><i>4</i><b>Collect post-change evidence</b><span class="dim">config snapshot / agent report</span></div>
+          <div class="vf-step"><i>5</i><b>Compare &amp; health-check</b><span class="dim">predicted vs observed</span></div>
+        </div>
+        <p class="muted" style="font-size:12.5px">Post-change verification compares the <b>predicted</b> state against the <b>real observed</b> state after deployment. Missing or stale evidence is never treated as success. A dry-run <span class="mono">pass</span> never overrides a post-change mismatch.</p>
+        <button type="button" class="btn" id="vf-open-${vid}">Open post-change verification</button>
+      </div>`;
+    const btn = holder.querySelector("#vf-open-" + vid);
+    btn.addEventListener("click", async () => {
+      btn.disabled = true; btn.innerHTML = `<span class="spinner"></span>&nbsp; Opening…`;
+      try {
+        const v = await vfCreate(report);
+        vfRenderInto(report, v, holder);
+      } catch (e) { toast("Open verification failed: " + e.message, true); btn.disabled = false; btn.textContent = "Open post-change verification"; }
+    });
+  }
+  return wrap;
+}
+
+function vfRenderInto(report, v, holder) {
+  const vid = report.audit && report.audit.verdict_id;
+  const s = report.summary || {};
+  const predSummary = (v.prediction || {}).summary || {};
+  const result = v.result || {};
+  const rsum = result.summary || {};
+  const st = v.status;
+  let html = `
+    <div class="vf-top">
+      <div class="vf-id">verification <span class="mono dim">${esc(v.id)}</span> · verdict <span class="mono dim">${esc(v.verdict_id || "")}</span>
+        · approved <span class="verdict-badge ${s.verdict === "pass" ? "" : ""}">${esc(s.verdict || "?")}</span> <span class="mono dim">${s.trust_score ?? "?"} trust</span>
+        ${v.change_fingerprint ? `<span class="mono dim">· fp ${esc(v.change_fingerprint)}</span>` : ""}</div>
+      <div class="vf-status-row">${renderVerifiedBadge(st)}
+        <span class="mono dim">prediction: ${predSummary.deltas ?? "—"} deltas (${predSummary.expected_present ?? 0} present / ${predSummary.expected_absent ?? 0} absent) · sim ${esc(predSummary.simulation_verdict || s.verdict)}</span>
+      </div>
+    </div>`;
+
+  /* evidence editor */
+  const sample = sampleEvidence(report);
+  const existingDocs = (v.evidence || []).length;
+  html += `
+    <div class="vf-card">
+      <div class="vf-card-head"><h3>Post-change evidence</h3>
+        <span class="mono dim">${existingDocs} document(s) stored · redacted at rest</span></div>
+      <p class="muted" style="font-size:12px">Paste the REAL observed state (config snapshot or agent report). Insert sample to prefill with the <b>predicted</b> state, then edit it to match what was actually deployed.</p>
+      <div class="vf-actions">
+        <button type="button" class="btn btn-secondary" id="vf-sample-${vid}">Insert sample (predicted state)</button>
+        <button type="button" class="btn btn-secondary" id="vf-clear-${vid}">Clear editor</button>
+      </div>
+      <textarea id="vf-evidence-editor-${vid}" rows="7" spellcheck="false" placeholder='[{"source":"snapshot","device":"192.168.1.1","section":"filters","collected_at":"...","confirmed":true,"content":{...}}]'>${esc(JSON.stringify(sample.slice(0, VERIF_SAMPLE_DOCS), null, 2))}</textarea>
+      <div class="vf-actions">
+        <button type="button" class="btn" id="vf-ev-${vid}">Save evidence</button>
+        <button type="button" class="btn btn-secondary" id="vf-run-${vid}" ${(v.evidence || []).length ? "" : "disabled"}>Run verification</button>
+        <a class="btn btn-secondary" id="vf-bundle-${vid}" ${v.bundle ? "" : "disabled=disabled"} style="text-decoration:none" href="/api/verifications/${esc(v.id)}/bundle" download>⬇ Diagnostic bundle</a>
+      </div>
+    </div>`;
+
+  /* result */
+  if (result.status) {
+    html += `<div class="vf-card">
+      <div class="vf-card-head"><h3>Result</h3>
+        <span class="mono dim">checked ${rsum.checked_at || ""}</span></div>
+      <div class="vf-stat-row">
+        <div class="vf-stat"><b>${rsum.deltas_confirmed ?? 0}</b><span>confirmed</span></div>
+        <div class="vf-stat"><b>${rsum.deltas_inconclusive ?? 0}</b><span>inconclusive</span></div>
+        <div class="vf-stat"><b>${rsum.mismatches ?? 0}</b><span>mismatches</span></div>
+        <div class="vf-stat"><b>${rsum.unexpected_changes ?? 0}</b><span>unexpected</span></div>
+        <div class="vf-stat"><b>${Math.round((rsum.confidence ?? 0) * 100)}%</b><span>confidence</span></div>
+      </div>
+      ${(v.edge_cases || []).length ? `<div class="vf-edge">${(v.edge_cases || []).map((e) => "· " + esc(e)).join("<br>")}</div>` : ""}
+      ${(result.mismatches || []).length ? `<div class="vf-card-head"><h3>Mismatches (grouped by root cause)</h3></div>` + vfMismatchRows(result.mismatches) : ""}
+      ${(result.unexpected_changes || []).length ? `<div class="vf-card-head"><h3>Unexpected unrelated changes</h3></div>` + vfUnexpectedRows(result.unexpected_changes) : ""}
+      <div class="vf-card-head"><h3>Health checks</h3></div>
+      <div class="vf-hc-list">${vfHealthRows(v.health_checks)}</div>
+      <div class="vf-card-head"><h3>Evidence coverage &amp; freshness</h3></div>
+      ${vfCoverage(rsum.coverage) || `<div class="vf-empty">No observations sampled.</div>`}
+    </div>`;
+    html += vfRollbackCard(v.rollback);
+  }
+  holder.innerHTML = html;
+
+  const sampleBtn = holder.querySelector("#vf-sample-" + vid);
+  if (sampleBtn) sampleBtn.addEventListener("click", () => {
+    const ta = holder.querySelector("#vf-evidence-editor-" + vid);
+    if (ta) ta.value = JSON.stringify(sample.slice(0, VERIF_SAMPLE_DOCS), null, 2);
+    toast("Evidence editor prefilled with the predicted state — edit to match reality.");
+  });
+  const clearBtn = holder.querySelector("#vf-clear-" + vid);
+  if (clearBtn) clearBtn.addEventListener("click", () => {
+    const ta = holder.querySelector("#vf-evidence-editor-" + vid);
+    if (ta) ta.value = "[]";
+  });
+  const evBtn = holder.querySelector("#vf-ev-" + vid);
+  if (evBtn) evBtn.addEventListener("click", async () => {
+    evBtn.disabled = true;
+    try {
+      const updated = await vfAddEvidence(report, v);
+      if (updated) { toast("Evidence saved."); vfRenderInto(report, updated, holder); }
+    } catch (e) { toast("Adding evidence failed: " + e.message, true); }
+    evBtn.disabled = false;
+  });
+  const runBtn = holder.querySelector("#vf-run-" + vid);
+  if (runBtn) runBtn.addEventListener("click", async () => {
+    runBtn.disabled = true; runBtn.innerHTML = `<span class="spinner"></span>&nbsp; Comparing…`;
+    try {
+      const out = await vfRun(report, VERIF_BY_VID[vid] || v);
+      vfRenderInto(report, out, holder);
+      toast("Verification: " + vfStatusLabel(out.status));
+    } catch (e) { toast("Running verification failed: " + e.message, true); runBtn.disabled = false; runBtn.textContent = "Run verification"; }
+  });
+  const bundle = holder.querySelector("#vf-bundle-" + vid);
+  if (bundle) bundle.addEventListener("click", (e) => {
+    if (!VERIF_BY_VID[vid] || !VERIF_BY_VID[vid].bundle) { e.preventDefault(); toast("Run the verification first to build its bundle.", true); }
+  });
+}
+
 function exportReport(report) {
   const payload = {
     exported_at: new Date().toISOString(),
@@ -2572,6 +3028,10 @@ function exportReport(report) {
     change: report.change,
     verdict: report.summary,
     findings: report.findings,
+    checklist: report.checklist || [],
+    trace: report.trace || [],
+    pipeline: report.pipeline || {},
+    drift: report.drift || null,
     matrix: report.matrix,
     requirements: report.requirements,
     flow_summary: { before: report.before, after: report.after },
@@ -2598,9 +3058,12 @@ function renderFindings(findings) {
     const el = document.createElement("div");
     el.className = `finding ${f.severity}`;
     el.innerHTML = `
-      <div class="finding-head"><h3><span class="sev">${f.severity}</span> ${esc(f.title)}</h3></div>
+      <div class="finding-head"><h3><span class="sev">${f.severity}</span> ${esc(f.title)}
+        ${f.category ? `<span class="cat-chip ${esc(f.category)}">${esc(f.category)}</span>` : ""}</h3></div>
       <p class="fd">${esc(f.detail)}</p>
+      ${f.why && f.why !== f.detail ? `<p class="fd dim">${esc(f.why)}</p>` : ""}
       ${f.requirement ? `<div class="req-line">requirement → ${esc(f.requirement)}</div>` : ""}
+      ${f.remediation && f.remediation.length ? `<div class="fix-line">fix → ${esc(f.remediation.join(" · "))}</div>` : ""}
       <div class="evidence">
         <div class="side before"><h4>Before</h4>${sideHTML(f.before)}</div>
         <div class="side after ${f.after && !f.after.reachable ? "bad" : ""}"><h4>After</h4>${sideHTML(f.after)}</div>
@@ -3234,19 +3697,21 @@ async function startSim(wrap, idx) {
   }, 3000 / simRunner.speed);
 }
 
-/* ------- blast-radius replay: internet → router → every device ---------- */
-/* When a change blocks flows (e.g. a deny-any-any at the top of the router
-   policy), tell the WHOLE story on the map Packet-Tracer style:
+/* ------- blast-radius replay: internet → router → affected devices --------
+   When a change REFUSES flows that were reachable before (e.g. a deny rule at
+   the top of the router policy), tell the WHOLE story on the map Packet-Tracer
+   style:
      1) an inbound packet arrives from the INTERNET (right) to the ROUTER (center)
      2) the router checks the change, finds it matches, and refuses the traffic
-     3) the refusal BLASTS out from the router to EVERY affected device —
-        red dashed links + red packets flying router → device + an ✖ on each. */
+     3) the refusal BLASTS out from the router to each AFFECTED device — red
+        dashed links + red packets flying router → device + an ✖ on each. */
 
 async function runMassSim(wrap) {
   const sel = wp$(wrap, "sim-flow");
   if (!sel || !sel.options.length) return;
   const flows = (wrap._flows || []).filter((f) =>
-    f.after && f.after.reachable === false && (hasPath(f.after) || (f.after.drop && f.after.drop.device)));
+    f.after && f.after.reachable === false && (hasPath(f.after) || (f.after.drop && f.after.drop.device))
+    && !(f.before && f.before.reachable === false));
   if (flows.length < 2) { startSim(wrap); return; }
 
   simRunner.paused = false;
@@ -3258,7 +3723,7 @@ async function runMassSim(wrap) {
   enableSimBtns(wrap);
   clearSimLog(wrap);
   clearSimRules(wrap);
-  setSimStatus(wrap, "playing the full scenario: internet → router → every device…");
+  setSimStatus(wrap, "playing the full scenario: internet → router → affected devices…");
 
   const svg = $("topo");
   svg.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -3288,7 +3753,7 @@ async function runMassSim(wrap) {
   const netCoord = internetDev && nodeCoords[internetDev.name];
 
   simLog(wrap, `AFTER the change — replaying ${flows.length} blocked flow(s) across ${jobs.length} device(s)`, "head");
-  simLog(wrap, `the full scenario: internet → ${routerName || "router"} → every device`, "hop");
+  simLog(wrap, `the full scenario: internet → ${routerName || "router"} → affected devices`, "hop");
 
   /* ---- PHASE 1 · the packet arrives from the internet (right → center) ---- */
   if (netCoord && routerCoord) {
@@ -3306,7 +3771,7 @@ async function runMassSim(wrap) {
   if (rg) rg.classList.add("flash-block");
   if (routerCoord) drawDropMark(svg, routerCoord, routerName, why);
   simLog(wrap, `${routerName || "router"} runs the policy: the packet MATCHES your change (${why}) — refused`, "block");
-  setSimStatus(wrap, `router refuses the packet (${why}) · blasting red signals to every device…`);
+  setSimStatus(wrap, `router refuses the packet (${why}) · blasting red signals to affected devices…`);
   await delay(700 / simRunner.speed);
   if (ctl !== simCancelCtl) return;
 
@@ -3442,18 +3907,36 @@ function delay(ms) { return new Promise((r) => setTimeout(r, ms)); }
 let _topoFlowState = null;   // { flows, raf, paused, speed, which, idx }
 
 /* Build the list of flows to animate from a validation report */
-function _buildTopoFlows(report, which) {
+function _buildTopoFlows(report, which, onlyChanged) {
   const flows = [];
   Object.keys(report.matrix || {}).forEach((k) => {
     const cell = report.matrix[k];
     const d = cell[which];
     if (!d || !d.path || !d.path.length) return;
+    /* "changed" = the change flipped this flow to refused / restored it */
+    const other = which === "after" ? cell.before : cell.after;
+    const changed = !!other && other.reachable === true && d.reachable === false;
+    const restored = !!other && other.reachable === false && d.reachable === true;
+    /* when showing what the change DID, skip flows that were already refused
+       before it — only the change's real victims may render red */
+    if (onlyChanged && !d.reachable && !changed) return;
     flows.push({
       key: k,
       path: d.path.slice(),
       reachable: d.reachable,
       drop: d.drop || {},
       status: d.status || "",
+      changed,
+      restored,
+      journey: (() => {
+        const p = d.path.slice();
+        /* the engine's path records only devices that forwarded/delivered;
+           a flow that dies at an ingress filter needs its blocking device
+           appended or the red dotted line can never reach the drop point */
+        const dropDev = (d.drop || {}).device;
+        if (!d.reachable && dropDev && p[p.length - 1] !== dropDev) p.push(dropDev);
+        return p;
+      })(),
     });
   });
   // blocked flows first so they're immediately visible
@@ -3469,10 +3952,11 @@ function _drawPathLines(svg, flows) {
     const color = f.reachable ? "#4cb782" : "#d97b6f";
     const opacity = f.reachable ? 0.28 : 0.45;
     const w = f.reachable ? 2.5 : 3;
-    for (let i = 0; i < f.path.length - 1; i++) {
-      const a = nodeCoords[f.path[i]], b = nodeCoords[f.path[i + 1]];
+    const segs = f.journey || f.path;
+    for (let i = 0; i < segs.length - 1; i++) {
+      const a = nodeCoords[segs[i]], b = nodeCoords[segs[i + 1]];
       if (!a || !b) continue;
-      const key = [f.path[i], f.path[i + 1]].sort().join("|") + color;
+      const key = [segs[i], segs[i + 1]].sort().join("|") + color;
       if (drawn.has(key)) continue;
       drawn.add(key);
       const line = svgNS("line", {
@@ -3494,7 +3978,7 @@ function _drawPathLines(svg, flows) {
 /* Animate a single packet dot along one flow's path, returns a Promise */
 function _animateFlowPacket(svg, flow, speed) {
   return new Promise((resolve) => {
-    const path = flow.path;
+    const path = flow.journey || flow.path;
     const color = flow.reachable ? "#4cb782" : "#d97b6f";
     const coords = path.map((n) => nodeCoords[n]).filter(Boolean);
     if (coords.length < 2) { resolve(); return; }
@@ -3595,7 +4079,16 @@ async function _topoFlowLoop(state) {
 
     if (state.parallel) {
       if (lbl) {
-        lbl.textContent = `${state.flows.length} refused paths · deny → every device ✗`;
+        const refused = state.flows.filter((f) => !f.reachable).length;
+        const names = (state.blast || []).map((b) => {
+          const n = b.path[b.path.length - 1] || "";
+          return b.dstIp ? `${n} (${b.dstIp})` : n;
+        });
+        const shown = names.length === 0 ? "every device ✗"
+          : names.length === 1 ? (names[0] || "target") + " ✗"
+          : names.length <= 3 ? names.join(", ") + " ✗"
+          : `${names.length} targets ✗`;
+        lbl.textContent = `${refused} refused paths · deny → ${shown}`;
         lbl.style.color = "var(--danger)";
       }
       await Promise.all(state.blast.map((f) => _animateFlowPacket(svg, f, state.speed)));
@@ -3625,15 +4118,16 @@ function startTopoFlowOverlay(report) {
   if (!svg) return;
 
   const which = "after";
-  const flows = _buildTopoFlows(report, which);
+  const flows = _buildTopoFlows(report, which, true);
   const blast = which === "after" ? denyBlastFlows(report) : [];
   blast.forEach((b) => {
     if (!flows.some((f) => f.path.join("|") === b.path.join("|"))) flows.push(b);
   });
   if (!flows.length) return;
 
-  // A deny blast sends a RED ball toward EVERY device at the same time so the
-  // whole network visibly refuses; matrix path lines stay as static context.
+  // A deny blast sends a RED ball toward just the devices the rule targets
+  // (dst "any" = everyone), so the whole network visibly refuses only what is
+  // actually cut off; matrix path lines stay as static context.
   const parallel = blast.length > 0;
 
   _drawPathLines(svg, flows);
@@ -3648,8 +4142,9 @@ function startTopoFlowOverlay(report) {
 }
 
 /* BFS the whole network from the device enforcing a DENY change and produce
-   one red (unreachable) flow toward every other system, so the replay shows
-   "the server refuses everyone". */
+   one red (unreachable) flow toward every system the change ACTUALLY affects
+   (its rule's destination), so the replay shows "this deny only cuts off the
+   devices it is written against" — never invented victims. */
 function denyBlastFlows(report) {
   if (!report || !report.change) return [];
   const ch = report.change;
@@ -3667,6 +4162,12 @@ function denyBlastFlows(report) {
   if (!enforcer) enforcer = devices_key0(devs);
   if (!enforcer) return [];
 
+  const targets = blastTargets(devs, ch.rule, enforcer);
+  if (!targets.length) return [];
+  const targetNames = new Set(targets.map((d) => d.name));
+  const tgtIp = {};
+  targets.forEach((d) => (tgtIp[d.name] = mainIp(d)));
+
   const adj = {};
   devs.forEach((d) => (adj[d.name] = []));
   links.forEach((l) => {
@@ -3683,11 +4184,60 @@ function denyBlastFlows(report) {
       if (seen.has(nxt)) return;
       seen.add(nxt);
       const np = path.concat(nxt);
-      flows.push({ key: `${enforcer.name} ~ ${nxt}`, path: np, reachable: false, drop: {}, status: "denied" });
+      if (targetNames.has(nxt)) {
+        flows.push({ key: `${enforcer.name} ~ ${nxt}`, path: np, reachable: false, drop: {}, status: "denied", dstIp: tgtIp[nxt] || "" });
+      }
       queue.push([nxt, np]);
     });
   }
   return flows;
+}
+
+function _ip4Int(ip) {
+  const parts = String(ip || "").split(".");
+  if (parts.length !== 4) return NaN;
+  const nums = parts.map((p) => parseInt(p, 10));
+  if (nums.some((n) => isNaN(n) || n < 0 || n > 255)) return NaN;
+  return ((nums[0] * 256 + nums[1]) * 256 + nums[2]) * 256 + nums[3];
+}
+
+/* Devices this deny rule really covers: dst "any" = everyone except the
+   enforcer; a bare IP = the one device holding it; a subnet = every device
+   with an address inside it. */
+function blastTargets(devs, rule, enforcer) {
+  let dst = String((rule && rule.dst) || "").trim();
+  if (!dst || dst === "any" || dst === "0.0.0.0" || dst === "0.0.0.0/0") {
+    return devs.filter((d) => d.name !== enforcer.name);
+  }
+  const slash = dst.indexOf("/");
+  let lo = -1, hi = -1;
+  if (slash >= 0) {
+    const raw = dst.slice(0, slash);
+    const plen = parseInt(dst.slice(slash + 1), 10);
+    if (isNaN(plen) || plen < 0 || plen > 32) return [];
+    lo = plen === 0 ? 0 : _ip4Prefix(raw, plen);
+    hi = lo + ((1 << (32 - plen)) - 1) >>> 0;
+  } else {
+    const v = _ip4Int(dst);
+    if (isNaN(v)) return [];
+    lo = hi = v;
+  }
+  const out = [];
+  for (const d of devs) {
+    if (d.name === enforcer.name) continue;
+    for (const iface of d.interfaces || []) {
+      const v = _ip4Int(String(iface.ip || "").replace(/\/.*/, ""));
+      if (!isNaN(v) && v >= lo && v <= hi) { out.push(d); break; }
+    }
+  }
+  return out;
+}
+
+function _ip4Prefix(ip, plen) {
+  const v = _ip4Int(ip);
+  if (isNaN(v)) return v;
+  const mask = plen === 0 ? 0 : (~0 << (32 - plen)) >>> 0;
+  return (v & mask) >>> 0;
 }
 
 function devices_key0(devs) { return devs[0]; }

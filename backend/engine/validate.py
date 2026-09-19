@@ -6,7 +6,7 @@ trust score, structured findings with evidence, and requirement results.
 """
 from __future__ import annotations
 
-from .model import MAX_IP, Net, Prefix, Requirement, parse_host_or_prefix, ip_int, ip_str
+from .model import MAX_IP, Finding, Net, Prefix, Requirement, parse_host_or_prefix, ip_int, ip_str
 from .reach import apply_change, resolve_flow
 from .metainfo import PROJECT_VERSION
 
@@ -450,6 +450,222 @@ def _cp_finding(sev, ftype, title, detail, before=None, after=None) -> dict:
     return {"severity": sev, "type": ftype, "title": title, "detail": detail, "before": before, "after": after}
 
 
+# --------------------------------------------------------------------------- #
+# Diagnostic enrichment (Phase 1: findings an engineer can act on)            #
+# --------------------------------------------------------------------------- #
+
+def _section_for(change_type: str) -> str:
+    return {
+        "add_filter_rule": "filter_rules", "remove_filter_rule": "filter_rules", "replace_filter_rule": "filter_rules",
+        "add_route": "routes", "remove_route": "routes",
+        "add_dst_nat": "dst_nat", "remove_dst_nat": "dst_nat",
+        "add_bgp_peer": "bgp", "remove_bgp_peer": "bgp",
+        "add_ospf_network": "ospf", "remove_ospf_network": "ospf",
+        "add_dns_record": "dns", "remove_dns_record": "dns",
+        "add_vlan_assignment": "vlan_assignment", "remove_vlan_assignment": "vlan_assignment",
+    }.get(change_type, "general")
+
+
+def _is_syntaxish(f: dict) -> bool:
+    blob = f"{f.get('title', '')} {f.get('detail', '')}".lower()
+    for token in ("range", "invalid", "reserved", "outside", "unsupported", "not supported", "negative", "unparsable", "foreign"):
+        if token in blob:
+            return True
+    return False
+
+
+def _category_for(f: dict) -> str:
+    t = f["type"]
+    if t in ("connectivity_loss", "path_change"):
+        return "reachability_impact"
+    if t in ("requirement", "new_exposure"):
+        return "policy_violation"
+    if t == "port_forward":
+        return "reachability_impact" if f["severity"] == "critical" else "operational_risk"
+    if t in ("bgp", "ospf", "dns", "vlan", "route"):
+        if _is_syntaxish(f):
+            return "syntax_error"
+        return "semantic_error" if f["severity"] == "critical" else "operational_risk"
+    return "semantic_error"
+
+
+def _flow_labels(f: dict) -> list[str]:
+    if f.get("requirement"):
+        return [str(f["requirement"])]
+    title = f.get("title", "")
+    if ": " in title:
+        return [title.split(": ", 1)[1]]
+    return []
+
+
+def _remediation_for(f: dict, change: dict) -> list[str]:
+    t = f["type"]
+    blob = f"{f.get('title', '')} {f.get('detail', '')}".lower()
+    if t == "vlan":
+        if "range" in blob or "outside 1-4094" in blob:
+            return ["Change VLAN id to a value between 1 and 4094",
+                    "Verify the VLAN exists in the VLAN assignment list before referencing it"]
+        if "host device" in blob:
+            return ["Remove the vlan assignment from the host device",
+                    "Move the port to an L2-capable switch if the segment must exist"]
+        if "default vlan" in blob:
+            return ["Assign an explicit, named access vlan instead of native vlan 1"]
+        if "segment change" in blob:
+            return ["Confirm the L2 segment move is intentional",
+                    "Update any client statically configured for the old vlan"]
+        return ["Review the vlan assignment and re-run validation"]
+    if t == "bgp":
+        if "asn" in blob:
+            return ["Use an ASN in the valid 1-65535 range",
+                    "Confirm the remote ASN matches the provider's documented value"]
+        if "unreachable" in blob or "no modelled device owns" in blob:
+            return ["Point the BGP neighbor at an address a managed device actually owns",
+                    "Verify the peering subnet is directly connected"]
+        if "default route" in blob or "route-leak" in blob:
+            return ["Do not export 0.0.0.0/0 to a transit peer",
+                    "Filter the export list to your own prefixes"]
+        if "blackhole" in blob:
+            return ["Add a static or connected route for the advertised prefix before exporting it"]
+        return ["Review the BGP peer configuration and re-run validation"]
+    if t == "ospf":
+        if "area id" in blob or "32-bit" in blob:
+            return ["Use an area id in the valid 32-bit range (0-4294967295)"]
+        if "multiple areas" in blob or "mismatch" in blob:
+            return ["Keep each subnet in one area across the segment",
+                    "Align the area id on every router sharing the link"]
+        if "foreign prefix" in blob or "no interface" in blob:
+            return ["Only advertise subnets directly attached to an interface on this device"]
+        if "wan-facing" in blob:
+            return ["Filter the Internet-facing subnet out of area advertisements",
+                    "Advertise interior networks only"]
+        return ["Review the OSPF advertisement and re-run validation"]
+    if t == "dns":
+        if "not supported" in blob or "rr type" in blob:
+            return ["Use a supported record type (A, AAAA, CNAME, MX, TXT, PTR, SRV)"]
+        if "outside the authoritative zone" in blob:
+            return ["Place the name inside the zone the server is authoritative for"]
+        if "negative ttl" in blob or "ttl" in blob:
+            return ["Use a TTL between 0 and 86400 seconds"]
+        if "not an ip" in blob or "unparsable" in blob:
+            return ["Give A/AAAA records a valid IPv4/IPv6 address"]
+        if "reserved address" in blob:
+            return ["Use a routable unicast address in the record"]
+        if "unmanaged target" in blob or "no modelled device owns" in blob:
+            return ["Point the record at an address a managed device owns", "Document the external target if it is intentional"]
+        if "dangling cname" in blob:
+            return ["Point the CNAME at a name that exists in this zone"]
+        if "zero records" in blob or "last record" in blob:
+            return ["Add another record for the name if it must keep resolving"]
+        return ["Review the DNS record and re-run validation"]
+    if t == "connectivity_loss":
+        return ["Review the change that altered this path and confirm the loss is intended",
+                "Add a permit / restore the route if the flow must keep working",
+                "Re-run validation after adjusting to confirm the flow is green"]
+    if t == "requirement":
+        return ["Fix the configuration so the AFTER state matches the requirement's expectation",
+                "Re-run validation and check this requirement turns green"]
+    if t == "new_exposure":
+        return ["Confirm this newly opened traffic is intended",
+                "Narrow src/dst/proto/port or add an explicit deny above the new rule"]
+    if t == "path_change":
+        return ["Verify the new forwarding path is acceptable",
+                "Add a more specific route or permit if the preferred path should be used"]
+    if t == "port_forward":
+        if "added but unreachable" in f.get("title", "") or "broken" in f.get("title", ""):
+            return ["Add a permit rule so the firewall stops the traffic before the host is reached",
+                    "Confirm the private host listens on the translated port"]
+        if "removed" in f.get("title", ""):
+            return ["Re-add the port-forward rule if the service must stay published"]
+        return ["Confirm the forward matches the intended published service"]
+    if t == "bgp-extra":
+        return ["Review the BGP change and re-run validation"]
+    return ["Review the reported value and correct the configuration",
+            "Re-run validation to confirm the fix"]
+
+
+def _location_for(change: dict, f: dict) -> dict:
+    loc: dict = {"change_type": change.get("type"),
+                 "config_section": _section_for(str(change.get("type") or ""))}
+    dev = change.get("device")
+    after = f.get("after") or {}
+    drop = after.get("drop") or {}
+    if not dev:
+        dev = drop.get("device")
+    if dev:
+        loc["device"] = dev
+    v = change.get("vlan") or {}
+    iface = change.get("iface") or v.get("iface") or drop.get("iface")
+    if iface:
+        loc["interface"] = iface
+    rule = drop.get("rule")
+    if rule:
+        loc["config_line"] = f"{drop.get('filter')} rule {rule}" if drop.get("filter") else str(rule)
+    return loc
+
+
+def _evidence_for(f: dict) -> dict:
+    ev: dict = {}
+    for side in ("before", "after"):
+        d = f.get(side)
+        if d is None:
+            continue
+        if isinstance(d, dict) and ("reachable" in d or "path" in d):
+            ev[side] = {
+                "reachable": d.get("reachable"),
+                "path": list(d.get("path") or []),
+                "drop": d.get("drop"),
+                "nat": d.get("nat"),
+                "trace_len": len(d.get("trace") or []),
+            }
+        else:
+            ev[f"{side}_provided"] = d
+    drop = (f.get("after") or {}).get("drop") or {}
+    if drop.get("rule"):
+        ev["rule_blocking"] = {"device": drop.get("device"), "filter": drop.get("filter"), "rule": drop.get("rule")}
+    return ev
+
+
+def _confidence_for(f: dict) -> str:
+    if f["type"] in ("bgp", "ospf", "dns", "vlan"):
+        return "high"  # change carries explicit confirmed values
+    drop = (f.get("after") or {}).get("drop") or {}
+    if drop.get("rule"):
+        return "high"  # exact confirmed rule match
+    return "medium"  # zone-level reachability inference
+
+
+def _impact_for(sev: str, flows: list[str]) -> int:
+    base = {"critical": 70, "warning": 40, "info": 10}[sev]
+    return max(0, min(100, base + len(flows) * 5))
+
+
+def _enrich_finding(change: dict, f: dict) -> dict:
+    f = dict(f)
+    flows = _flow_labels(f)
+    remediation = _remediation_for(f, change)
+    plain = f"{f['severity'].upper()}: {f['title']}. {f['detail']}"
+    if remediation:
+        plain += f" Fix: {remediation[0]}"
+    return Finding(
+        severity=f["severity"],
+        type=f["type"],
+        title=f["title"],
+        detail=f["detail"],
+        category=_category_for(f),
+        why=f["detail"],
+        location=_location_for(change, f),
+        affected_flows=flows,
+        impact_score=_impact_for(f["severity"], flows),
+        plain_english=plain,
+        remediation=remediation,
+        confidence=_confidence_for(f),
+        evidence=_evidence_for(f),
+        before=f.get("before"),
+        after=f.get("after"),
+        extra={k: v for k, v in f.items() if k in ("requirement", "port_forward")},
+    ).to_dict()
+
+
 def _check_bgp(net: Net, after: Net, change: dict) -> list[dict]:
     dev_name = change.get("device")
     dev = after.devices.get(dev_name)
@@ -664,7 +880,41 @@ def _control_plane_findings(net: Net, after: Net, change: dict) -> list[dict]:
         return _check_dns(net, after, change)
     if ctype in ("add_vlan_assignment", "remove_vlan_assignment"):
         return _check_vlan(net, after, change)
+    if ctype == "remove_route":
+        return _check_route_removal(net, after, change)
     return []
+
+
+def _check_route_removal(net: Net, after: Net, change: dict) -> list[dict]:
+    """Removing a non-default route that covers an interior zone prefix is a
+    silent-outage hazard: traffic aimed at that zone can only egress toward the
+    uplink and blackhole. Surface it as a warning so it is never a quiet pass."""
+    dev_name = change.get("device") or ""
+    dev = net.devices.get(dev_name)
+    if dev is None:
+        return []
+    idx = int(change.get("index", change.get("at_index", 0)))
+    if not (0 <= idx < len(dev.routes)):
+        return []
+    removed = dev.routes[idx]
+    if removed.network in ("0.0.0.0/0", "default"):
+        return []  # default-route removal is guardrailed as critical already
+    try:
+        rp = Prefix.parse(str(removed.network))
+    except (ValueError, TypeError):
+        return []
+    interior = [z.name for z in net.zones.values()
+                if z.prefix is not None and (z.is_source or z.is_dest) and rp.contains(z.prefix.lo)]
+    if not interior:
+        return []
+    names = ", ".join(sorted(interior))
+    return [_cp_finding(
+        "warning", "route",
+        f"Route removal cuts the path to {names}",
+        f"Removing {removed.network} via {removed.next_hop} on '{dev_name}' removes the only "
+        f"modelled route toward {names}; traffic aimed there would egress the uplink and "
+        "blackhole instead. Verify another route covers those networks."
+    )]
 
 
 # --------------------------------------------------------------------------- #
@@ -818,6 +1068,7 @@ def validate_change(net: Net, change: dict) -> dict:
     ninfo = sum(1 for f in findings if f["severity"] == "info")
 
     findings.extend(_control_plane_findings(net, net_after, change))
+    findings = [_enrich_finding(change, f) for f in findings]
     ncrit = sum(1 for f in findings if f["severity"] == "critical")
     nwarn = sum(1 for f in findings if f["severity"] == "warning")
     ninfo = sum(1 for f in findings if f["severity"] == "info")
@@ -855,6 +1106,8 @@ def validate_change(net: Net, change: dict) -> dict:
         "findings": sorted(findings, key=lambda x: {"critical": 0, "warning": 1, "info": 2}[x["severity"]]),
         "matrix": {f"{k[0]} ~ {k[1]}": v for k, v in matrix.items()},
         "requirements": req_results,
+        "trace": _build_trace(before, after, flows),
+        "checklist": _build_checklist(change, net, net_after, before, after, flows),
         "before": _summary_of(before),
         "after": _summary_of(after),
         "control_plane": {
@@ -911,3 +1164,142 @@ def _reason_text(a: dict) -> str:
         where = f" on {drop['device']}" if drop.get("device") else ""
         return f"Packet cannot be routed{where} ({drop['detail']})."
     return a["status"]
+
+
+def _trace_hops(steps: list[dict], drop: dict | None) -> list[dict]:
+    """Per-hop journey of a flow: device -> interface -> decision at each stop."""
+    hops: list[dict] = []
+    for i, s in enumerate(steps):
+        hops.append({
+            "order": i + 1,
+            "device": s.get("device"),
+            "iface": s.get("iface"),
+            "note": s.get("note"),
+        })
+    if drop and isinstance(drop, dict):
+        hops.append({
+            "order": len(hops) + 1,
+            "device": drop.get("device"),
+            "iface": drop.get("iface"),
+            "note": drop.get("detail"),
+            "filter": drop.get("filter"),
+            "rule": drop.get("rule") or (f"default {drop.get('default')}" if drop.get("default") else None),
+            "action": ("deny" if drop.get("allowed") is False else None),
+        })
+    return hops
+
+
+def _build_trace(before: dict, after: dict, flows: list[dict]) -> list[dict]:
+    """Hop-by-hop trace for every flow whose verdict the change actually moved.
+
+    Engineers debug what CHANGED, so unchanged flows are omitted and the trace
+    follows the AFTER state (the one the change produced).
+    """
+    traces: list[dict] = []
+    for f in flows:
+        key = f["key"]
+        b, a = before[key], after[key]
+        if b["status"] == a["status"] and b["reachable"] == a["reachable"]:
+            continue
+        traces.append({
+            "flow": {
+                "label": f["label"],
+                "kind": f["kind"],
+                "src": f.get("src_zone") or ip_str(f["src_rep"]),
+                "dst": ip_str(f["dst_ip"]),
+                "proto": f["proto"],
+                "dport": (str(f["dport"]) if f["dport"] is not None else "any"),
+            },
+            "before": {"status": b["status"], "reachable": b["reachable"]},
+            "after": {"status": a["status"], "reachable": a["reachable"]},
+            "path": a["path"],
+            "hops": _trace_hops(a["steps"], a["drop"]),
+            "drop": a["drop"] if a["drop"] else None,
+            "nat": a["nat"],
+        })
+    return traces[:500]
+
+
+KNOWN_CHANGE_TYPES = {
+    "add_filter_rule", "remove_filter_rule", "replace_filter_rule",
+    "add_route", "remove_route", "replace_route",
+    "add_dst_nat", "remove_dst_nat",
+    "add_bgp_peer", "remove_bgp_peer",
+    "add_ospf", "remove_ospf",
+    "add_dns_record", "remove_dns_record",
+    "add_vlan_assignment", "remove_vlan_assignment",
+}
+
+
+def _build_checklist(change: dict, net: Net, net_after: Net, before: dict, after: dict,
+                     flows: list[dict]) -> list[dict]:
+    """The pre-apply checklist an engineer steps through before clicking deploy.
+
+    Every line is a yes/no the human can verify: does the target exist, what
+    devices are in the blast radius, do requirements survive, how much traffic
+    flips. Structured for the dashboard to render as a tappable list.
+    """
+    items: list[dict] = []
+    ctype = str(change.get("type") or "")
+    if ctype in KNOWN_CHANGE_TYPES:
+        items.append({"id": "change_type", "status": "ok",
+                      "label": f"Change '{ctype}' is an engine-supported operation",
+                      "detail": "Validated against control-plane and data-plane rules."})
+    else:
+        items.append({"id": "change_type", "status": "fail",
+                      "label": f"Change '{ctype or '?'}' is not a recognized operation",
+                      "detail": "No engine rule applies - this will likely be ignored or rejected."})
+
+    dev = change.get("device")
+    if dev:
+        ok = dev in net.devices
+        items.append({"id": "target_device", "status": "ok" if ok else "fail",
+                      "label": f"Target device '{dev}' exists", "detail": "" if ok else
+                      "Unknown device - no interface, route or NAT can be edited on it."})
+    else:
+        items.append({"id": "target_device", "status": "info",
+                      "label": "Change is not device-scoped", "detail": "Applies at the whole-model level."})
+
+    filt = change.get("filter")
+    if filt:
+        attachments = sorted({i.name for d in net.devices.values() for i in d.interfaces if filt in (i.filters or ())})
+        items.append({"id": "filter_placement", "status": "ok", "label": f"Filter '{filt}' on {len(attachments)} interface(s)",
+                      "detail": ", ".join(attachments) if attachments else "Defined but not attached to any interface."})
+
+    lost, gained = 0, 0
+    changed_devices: set[str] = set()
+    for f in flows:
+        if f["kind"] not in ("zone", "requirement"):
+            continue
+        key = f["key"]
+        b, a = before[key], after[key]
+        if b["reachable"] and not a["reachable"]:
+            lost += 1
+        elif not b["reachable"] and a["reachable"]:
+            gained += 1
+        if b["status"] != a["status"] or b["reachable"] != a["reachable"]:
+            for s in a["steps"] or []:
+                if s.get("device"):
+                    changed_devices.add(s["device"])
+    items.append({"id": "traffic_impact", "status": "fail" if lost else ("warn" if gained else "ok"),
+                  "label": f"{lost} flow(s) lose connectivity, {gained} new flow(s) opened",
+                  "detail": "Zone-matrix traffic that flips as a result of this change."})
+
+    reqs = [f for f in flows if f["kind"] == "requirement"]
+    broken = [f["key"] for f in reqs if after[f["key"]]["reachable"] != (f["expect"] == "reachable")]
+    items.append({"id": "requirements", "status": "fail" if broken else "ok",
+                  "label": f"Requirements {len(reqs) - len(broken)}/{len(reqs)} still met",
+                  "detail": "; ".join(broken) if broken else "All stated requirements remain satisfied by the after-state."})
+
+    cp = _cp_inventory(net)
+    cpa = _cp_inventory(net_after)
+    moved_cp = [k for k in cp if cp[k] != cpa[k]]
+    items.append({"id": "control_plane", "status": "ok", "label": "Control-plane inventory unchanged",
+                  "detail": "No BGP / OSPF / DNS / VLAN objects move." if not moved_cp else
+                  "Control-plane moved: " + ", ".join(f"{k} {cp[k]}->{cpa[k]}" for k in moved_cp)})
+
+    if changed_devices:
+        items.append({"id": "blast_radius", "status": "info",
+                      "label": f"Blast radius: {len(changed_devices)} device(s) on moved paths",
+                      "detail": ", ".join(sorted(changed_devices))})
+    return items

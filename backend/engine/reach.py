@@ -7,6 +7,7 @@ and transparent for an MVP.
 """
 from __future__ import annotations
 
+import ipaddress
 from copy import deepcopy
 
 from .model import DstNatRule, Device, Filter, Net, Prefix, ip_int, ip_str
@@ -380,6 +381,57 @@ def resolve_next_hop(net: Net, dev: Device, next_hop_ip: int):
     return None, None, None
 
 
+_PRIVATE_NETS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+)
+
+
+def _is_private(ip: int) -> bool:
+    return any(ipaddress.ip_address(ip) in n for n in _PRIVATE_NETS)
+
+
+def _egresses_to_cloud(net: Net, start: str, dst_ip: int) -> bool:
+    """True if the packet destined for ``dst_ip`` is FORCED out toward the
+    internet cloud from ``start`` onwards.
+
+    Walks the longest-prefix-match route toward ``dst_ip`` hop by hop. If it
+    reaches a cloud device, the LAN device is about to hand a private address
+    to the uplink (classic silent blackhole) - report True. If it instead
+    lands on a device that owns the address or has it on a connected segment,
+    the destination is delivered locally and this is a normal path."""
+    seen: set[str] = set()
+    d = start
+    for _ in range(6):
+        if d in seen:
+            return False
+        seen.add(d)
+        dev = net.devices.get(d)
+        if dev is None:
+            return False
+        if dev.dtype == "cloud":
+            return True
+        if dst_ip in dev.own_ips():
+            return False
+        if any(i.prefix is not None and i.prefix.contains(dst_ip) for i in dev.interfaces):
+            return False
+        best = None
+        for r in dev.routes:
+            if r.prefix is not None and r.prefix.contains(dst_ip) and \
+               (best is None or r.prefix.plen > best.prefix.plen):
+                best = r
+        if best is None:
+            return False
+        n2, _, _ = resolve_next_hop(net, dev, ip_int(best.next_hop))
+        if n2 is None:
+            return False
+        d = n2
+    return False
+
+
 def resolve_flow(net: Net, src_rep: int, src_origin: str, dst_ip: int, proto: str, dport, established: set | None = None) -> dict:
     """Walk the data plane from the source device to the destination.
 
@@ -502,6 +554,18 @@ def resolve_flow(net: Net, src_rep: int, src_origin: str, dst_ip: int, proto: st
         if nbr is None:
             steps.append({"device": cur.name, "iface": arrived_iface, "note": f"next hop {best.next_hop} unreachable"})
             return _verdict("no_route", path, drop={"device": cur.name, "detail": f"next hop {best.next_hop} not in model"}, steps=steps, trace=trace_all)
+
+        # anti-blackhole: private destinations must never be handed to the
+        # uplink. If the only route egresses toward the internet cloud, the
+        # packet would vanish (classic silent outage after a LAN route is
+        # removed) - report it as blocked instead of "delivered at the cloud".
+        if _is_private(dst_ip) and _egresses_to_cloud(net, nbr, dst_ip):
+            steps.append({"device": cur.name, "iface": local_iface, "note":
+                          "private destination routed toward the uplink - egress would blackhole"})
+            return _verdict("blocked", path, drop={
+                "device": cur.name, "blackhole": True,
+                "detail": "destination is a private address but the only route egresses to the uplink - would blackhole",
+                "by_default": True}, steps=steps, trace=trace_all)
 
         # 6) source NAT at the egress interface
         if cur.nat is not None:
